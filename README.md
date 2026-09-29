@@ -41,6 +41,9 @@ go install github.com/orca-ae/orca-cli/cmd/ork@latest
 
 `ork --version` prints the installed version.
 
+Maintainers publish through Release Please: merge the Release PR to trigger artifact publication,
+then merge the Homebrew formula PR. See [Publishing a release](CONTRIBUTING.md#publishing-a-release).
+
 ## Quick start
 
 Start an engine on this machine, then use it. You need Docker with Compose v2.

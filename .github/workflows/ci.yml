@@ -51,6 +51,9 @@ jobs:
       - name: Validate GitHub workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
+      - name: Validate release tag creation
+        run: ./tests/create-release-tag.sh
+
       - name: Run unit and exhaustive CLI command E2E tests
         run: go test ./...
 

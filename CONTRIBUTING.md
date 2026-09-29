@@ -93,16 +93,31 @@ as the [README](README.md#quick-start) describes.
 
 ### Publishing a release
 
-`release.yml` runs when a `v*.*.*` tag is pushed. It publishes binary archives and container images,
-then opens a formula update pull request in `orca-ae/homebrew-tap`. A maintainer merges that pull
-request before the new version is available through `brew install orca-ae/tap/ork`. This workflow
-does not create release-preparation pull requests or choose the next version automatically.
+1. Pushes to `main` run `release-please.yml`, which creates or updates a Release PR from
+   Conventional Commits. The PR updates `CHANGELOG.md` and `.release-please-manifest.json`.
+   The initial version is `0.1.0`; while below 1.0, features and breaking changes bump the minor
+   version, and fixes bump the patch version. Review and squash-merge the Release PR.
+2. Release Please creates a **draft** GitHub Release. Only after the draft exists, a separate
+   job creates its `v*.*.*` tag at the release commit. Do not enable `force-tag-creation`: it
+   creates the tag before the draft and can race with the artifact workflow.
+3. The tag triggers `release.yml`, which resumes the draft, builds and publishes binary archives
+   and container images, and publishes the GitHub Release. CLI versions are still stamped from
+   the tag at build time; no source-code version constant is maintained.
+4. The same workflow opens a formula PR in `orca-ae/homebrew-tap`. A maintainer merges it before
+   the new version is available through `brew install orca-ae/tap/ork`.
 
-The Homebrew step uses the `SNBOT_GITHUB_TOKEN` Actions secret available to `orca-ae/orca-cli`.
-The token must have access to `orca-ae/homebrew-tap` with **Contents: read and write** and
-**Pull requests: read and write** permissions. Release assets are downloaded using the CLI
-repository's `GITHUB_TOKEN`; only tap operations use `SNBOT_GITHUB_TOKEN`. If the secret is absent,
-the workflow warns and skips the formula update without failing the release.
+The `SNBOT_GITHUB_TOKEN` Actions secret available to `orca-ae/orca-cli` must have access to both
+`orca-ae/orca-cli` and `orca-ae/homebrew-tap`, with **Contents: read and write** and
+**Pull requests: read and write** permissions. Tagging commits that change workflows may also
+require **Workflows: read and write**. Unlike `GITHUB_TOKEN`, this token lets generated PRs
+trigger CI and generated tags trigger the artifact workflow. Artifact publication still uses
+the CLI repository's `GITHUB_TOKEN`.
+
+If the secret is absent, release preparation fails explicitly; the Homebrew step in a manually
+tagged release still warns and skips the formula update. `workflow_dispatch` on `main` can
+refresh release preparation. If the tag job fails after the draft is created, use **Re-run failed
+jobs**, not a new workflow run, to preserve the preparation job's tag and commit outputs.
+Existing tags at the same commit are accepted; conflicting tags are never moved.
 
 ## How the code is organized
 

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "go",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "initial-version": "0.1.0",
+  "draft": true,
+  "force-tag-creation": false,
+  "pull-request-title-pattern": "release: ${version}",
+  "pull-request-header": "Automated Release PR",
+  "packages": {
+    ".": {}
+  }
+}
