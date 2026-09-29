@@ -1,0 +1,68 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "The following files need gofmt:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check license headers
+        run: scripts/check-license-headers.sh
+
+      - name: Validate E2E shell scripts
+        run: |
+          bash -n tests/e2e/*.sh
+          tests/e2e/test-aggregation.sh
+
+      - name: Validate GitHub workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Run unit and exhaustive CLI command E2E tests
+        run: go test ./...
+
+      # Every third-party module compiled into ork must carry a license that
+      # lets us ship it without publishing its source: no reciprocal
+      # (MPL, EPL), restricted (GPL, LGPL) or unidentified licenses.
+      # Modules under github.com/orca-ae are this project's own.
+      - name: Check dependency licenses
+        run: >-
+          go run github.com/google/go-licenses/v2@v2.0.1 check ./cmd/ork
+          --ignore github.com/orca-ae
+          --disallowed_types=forbidden,restricted,reciprocal,unknown
+
+      - name: Build CLI
+        run: go build ./cmd/ork

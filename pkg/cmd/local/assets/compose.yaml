@@ -1,0 +1,156 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orca
+      POSTGRES_PASSWORD: orca
+      POSTGRES_DB: orca
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: [CMD, pg_isready, -U, orca]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # S3-compatible object store for the Registry's and Harness's files. No port
+  # is published, so these static credentials only work inside the stack.
+  rustfs:
+    image: rustfs/rustfs:1.0.0
+    environment:
+      RUSTFS_ACCESS_KEY: orca-local
+      RUSTFS_SECRET_KEY: orca-local-secret
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:9000/health]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Creates the bucket. It reuses the RustFS image, whose curl signs S3
+  # requests itself, so the bootstrap pulls no extra image.
+  rustfs-bootstrap:
+    image: rustfs/rustfs:1.0.0
+    entrypoint: [/bin/sh, /bootstrap.sh]
+    environment:
+      S3_ENDPOINT: http://rustfs:9000
+      S3_BUCKET: orca-files
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: orca-local
+      S3_SECRET_ACCESS_KEY: orca-local-secret
+    volumes:
+      - ./rustfs-bootstrap.sh:/bootstrap.sh:ro
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    restart: "no"
+
+  migrate:
+    image: ${ORCA_LOCAL_REGISTRY_IMAGE:-docker.io/streamnative/orca-registry-service-ts@sha256:5d309fe8cdd3200f8e3392344bfe8d2f2b369960938cb3d09bc4c62a67aa35ce}
+    command: [node, dist/migrate.js]
+    environment:
+      DATABASE_URL: postgres://orca:orca@postgres:5432/registry
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  registry:
+    image: ${ORCA_LOCAL_REGISTRY_IMAGE:-docker.io/streamnative/orca-registry-service-ts@sha256:5d309fe8cdd3200f8e3392344bfe8d2f2b369960938cb3d09bc4c62a67aa35ce}
+    environment:
+      NODE_ENV: development
+      HTTP_PORT: "8080"
+      INTERNAL_HTTP_PORT: "8081"
+      ADMIN_HTTP_PORT: "8082"
+      DATABASE_URL: postgres://orca:orca@postgres:5432/registry
+      TRANSCRIPT_STORE_BACKEND: postgres
+      TRANSCRIPT_STORE_DATABASE_URL: postgres://orca:orca@postgres:5432/transcriptstore
+      FILESTORE_DATABASE_URL: postgres://orca:orca@postgres:5432/filestore
+      MEMORYSTORE_DATABASE_URL: postgres://orca:orca@postgres:5432/memorystore
+      INTERNAL_AUTH_MODE: static_token
+      INTERNAL_SERVICE_TOKEN_FILE: /run/secrets/internal-token
+      SESSION_JWT_PRIVATE_KEY_PEM: /run/secrets/session-jwt-private
+      SESSION_JWT_ISSUER: orca-registry
+      SESSION_JWT_AUDIENCE: ai-gateway
+      ORCA_SECRET_STORE_MODE: local
+      S3_ENDPOINT: http://rustfs:9000
+      S3_FORCE_PATH_STYLE: "true"
+      S3_BUCKET: orca-files
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: orca-local
+      S3_SECRET_ACCESS_KEY: orca-local-secret
+      AI_GATEWAY_MCP_URL: http://ai-gateway:8090/v1/mcp
+      AI_GATEWAY_LLM_URL: http://ai-gateway:8090/v1
+    ports:
+      - 127.0.0.1:${ORCA_LOCAL_REGISTRY_PORT:-8080}:8080
+      - 127.0.0.1:${ORCA_LOCAL_ADMIN_PORT:-18082}:8082
+    volumes:
+      - ./secrets/internal-token:/run/secrets/internal-token:ro
+      - ./secrets/session-jwt-private.pem:/run/secrets/session-jwt-private:ro
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8082/healthz').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rustfs-bootstrap:
+        condition: service_completed_successfully
+
+  harness:
+    image: ${ORCA_LOCAL_HARNESS_IMAGE:-docker.io/streamnative/orca-harness-server@sha256:5f783231660b4b65f3986ff4fb9712571fb0b2339b378cbcb246654a07c2a8f9}
+    environment:
+      NODE_ENV: development
+      HTTP_PORT: "9094"
+      TRANSCRIPT_STORE_BACKEND: postgres
+      TRANSCRIPT_STORE_DATABASE_URL: postgres://orca:orca@postgres:5432/transcriptstore
+      FILESTORE_DATABASE_URL: postgres://orca:orca@postgres:5432/filestore
+      POSTGRES_EVENT_POLL_INTERVAL_MS: "250"
+      REGISTRY_INTERNAL_BASE_URL: http://registry:8081
+      INTERNAL_SERVICE_TOKEN_FILE: /run/secrets/internal-token
+      SANDBOX_RUNTIME: in-memory
+      ALLOW_INSECURE_STATIC_S3_CREDS: "true"
+      S3_ENDPOINT: http://rustfs:9000
+      S3_STS_ENDPOINT: http://rustfs:9000
+      S3_FORCE_PATH_STYLE: "true"
+      S3_BUCKET: orca-files
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: orca-local
+      S3_SECRET_ACCESS_KEY: orca-local-secret
+      AI_GATEWAY_URL: http://ai-gateway:8090
+      LLM_EGRESS_DEFAULT: ${ORCA_LOCAL_LLM_EGRESS:-direct}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      - ./secrets/internal-token:/run/secrets/internal-token:ro
+      - harness-work:/var/tmp/orca-harness
+    depends_on:
+      registry:
+        condition: service_started
+
+  ai-gateway:
+    profiles: [gateway]
+    image: ${ORCA_LOCAL_GATEWAY_IMAGE:-ghcr.io/orca-ae/orca-ai-gateway:v0.4.2-rc.1}
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      - ./gateway.yaml:/etc/orca-gateway/config.yaml:ro
+      - ./secrets/session-jwt-public.pem:/etc/orca-gateway/session-jwt-pub.pem:ro
+      - ./secrets/internal-token:/run/secrets/internal-token:ro
+    depends_on:
+      registry:
+        condition: service_started
+
+volumes:
+  postgres-data:
+  rustfs-data:
+  harness-work:

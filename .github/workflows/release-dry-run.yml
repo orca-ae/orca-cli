@@ -1,0 +1,178 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Exercise the release-only Docker path on pull requests. Tag releases own
+# registry login, signing, and publication; this workflow never pushes images.
+name: Release dry run
+
+on:
+  pull_request:
+    paths:
+      - '.dockerignore'
+      - 'Dockerfile'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-dry-run.yml'
+      - '.github/workflows/reconcile-latest.yml'
+      - 'cmd/**'
+      - 'pkg/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'LICENSE'
+      - 'NOTICE'
+      - 'scripts/**'
+      - 'tests/*.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build multi-arch image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint release workflows
+        run: |
+          docker run --rm \
+            --volume "${PWD}:/repo" \
+            --workdir /repo \
+            rhysd/actionlint:1.7.7 \
+            -color=false \
+            .github/workflows/release.yml \
+            .github/workflows/release-dry-run.yml \
+            .github/workflows/reconcile-latest.yml
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate release helpers
+        run: |
+          ./tests/release-metadata.sh
+          ./tests/dockerhub-metadata.sh
+          ./tests/homebrew-formula.sh
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build release archives
+        run: ./scripts/build-release-archives.sh v0.0.0-release-dry-run 0.0.0-release-dry-run
+
+      - name: Check release archives and formula
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          (cd dist && sha256sum -c checksums.txt)
+          for archive in dist/ork_*.tar.gz; do
+            name="$(basename "${archive}" .tar.gz)"
+            listing="$(tar -tzf "${archive}")"
+            for member in ork LICENSE NOTICE README.md THIRD_PARTY_LICENSES/; do
+              grep -Fqx "${name}/${member}" <<< "${listing}"
+            done
+          done
+          ./scripts/homebrew-formula.sh v0.0.0-release-dry-run dist/checksums.txt > "${RUNNER_TEMP}/ork.rb"
+          ruby -c "${RUNNER_TEMP}/ork.rb"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: false
+          tags: local/orca-cli:release-dry-run
+          outputs: type=oci,dest=${{ runner.temp }}/orca-cli.oci.tar
+          build-args: |
+            ORCA_CLI_VERSION=0.0.0-release-dry-run
+            ORCA_CLI_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=release-dry-run-orca-cli
+          cache-to: type=gha,mode=max,scope=release-dry-run-orca-cli
+          provenance: true
+          sbom: true
+
+      - name: Verify OCI platform manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          layout="${RUNNER_TEMP}/orca-cli-oci"
+          mkdir -p "${layout}"
+          tar -xf "${RUNNER_TEMP}/orca-cli.oci.tar" -C "${layout}"
+          index_digest="$(jq -r '.manifests[0].digest' "${layout}/index.json")"
+          manifest="${layout}/blobs/sha256/${index_digest#sha256:}"
+          jq -e '
+            [.manifests[].platform
+              | select(.os == "linux")
+              | "\(.os)/\(.architecture)"]
+            | sort == ["linux/amd64", "linux/arm64"]
+          ' "${manifest}" >/dev/null
+
+      - name: Build loadable amd64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          pull: false
+          load: true
+          tags: local/orca-cli:release-dry-run-amd64
+          build-args: |
+            ORCA_CLI_VERSION=0.0.0-release-dry-run
+            ORCA_CLI_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=release-dry-run-orca-cli
+          provenance: false
+          sbom: false
+
+      - name: Build loadable arm64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          pull: false
+          load: true
+          tags: local/orca-cli:release-dry-run-arm64
+          build-args: |
+            ORCA_CLI_VERSION=0.0.0-release-dry-run
+            ORCA_CLI_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=release-dry-run-orca-cli
+          provenance: false
+          sbom: false
+
+      - name: Smoke test image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for arch in amd64 arm64; do
+            image="local/orca-cli:release-dry-run-${arch}"
+            help_output="$(docker run --rm --platform "linux/${arch}" "${image}" --help)"
+            grep -Fq 'Manage and interact with resources in Orca Agent Engine' <<< "${help_output}"
+            test "$(docker run --rm --platform "linux/${arch}" "${image}" --version)" = \
+              'ork version 0.0.0-release-dry-run'
+            docker run --rm --platform "linux/${arch}" \
+              --env ORCA_REGISTRY_URL=https://registry.example.test/v1/registry \
+              --env ORCA_ACCESS_TOKEN=runtime-only-test-token \
+              --entrypoint /bin/sh "${image}" -ec '
+              test "$(id -u)" = 1000
+              test "$(id -g)" = 1000
+              test "$HOME" = /home/orca
+              test -w "$HOME"
+              test "$ORCA_REGISTRY_URL" = https://registry.example.test/v1/registry
+              test "$ORCA_ACCESS_TOKEN" = runtime-only-test-token
+              command -v ork >/dev/null
+              test -f /usr/share/doc/ork/LICENSE
+              test -f /usr/share/doc/ork/NOTICE
+              test -d /usr/share/doc/ork/THIRD_PARTY_LICENSES
+            '
+            test "$(docker image inspect "${image}" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = \
+              'Apache-2.0'
+            test "$(docker image inspect "${image}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = \
+              '0.0.0-release-dry-run'
+          done

@@ -1,0 +1,306 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Reconcile mutable latest aliases from published release state. Runs are
+# globally serialized, but GitHub may replace an older pending run with a newer
+# one; this is safe because every run recomputes the complete desired state.
+name: Reconcile latest release
+
+on:
+  workflow_run:
+    workflows: ['Release']
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: reconcile-latest-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    if: github.repository == 'orca-ae/orca-cli'
+    name: Reconcile highest stable release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Resolve Docker Hub settings
+        id: registry
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_NAMESPACE }}
+        shell: bash
+        run: ./scripts/dockerhub-metadata.sh >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve highest published stable release
+        id: desired
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_DOCKERHUB_ENABLED: ${{ steps.registry.outputs.credentials }}
+          CURRENT_DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          stable_versions="${RUNNER_TEMP}/stable-versions.txt"
+          : > "${stable_versions}"
+          while IFS= read -r tag; do
+            version="${tag#v}"
+            if [[ "${tag}" == v* && "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              printf '%s %s\n' "${version}" "${tag}" >> "${stable_versions}"
+            else
+              echo "::warning::Ignoring published non-SemVer stable release tag ${tag}."
+            fi
+          done < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'
+          )
+
+          if [[ ! -s "${stable_versions}" ]]; then
+            echo 'No published stable SemVer release exists; latest remains unchanged.'
+            echo 'found=false' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          read -r version tag < <(sort -V -k1,1 "${stable_versions}" | tail -n 1)
+          release_json="$(
+            gh release view "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets,isDraft,isPrerelease,tagName
+          )"
+          if [[ "$(jq -r '.isDraft' <<< "${release_json}")" != 'false' ||
+                "$(jq -r '.isPrerelease' <<< "${release_json}")" != 'false' ]]; then
+            echo "::error::Selected latest release ${tag} is not a published stable release."
+            exit 1
+          fi
+
+          state_asset_count="$(
+            jq '[.assets[] | select(.name == "image-digests.txt")] | length' \
+              <<< "${release_json}"
+          )"
+          if [[ "${state_asset_count}" -ne 1 ]]; then
+            echo "::error::Release ${tag} must contain exactly one image-digests.txt asset."
+            exit 1
+          fi
+
+          state_dir="${RUNNER_TEMP}/latest-state"
+          mkdir -p "${state_dir}"
+          gh release download "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern image-digests.txt \
+            --dir "${state_dir}"
+          state_file="${state_dir}/image-digests.txt"
+
+          state_value() {
+            local key="$1"
+            awk -F= -v key="${key}" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' \
+              "${state_file}"
+          }
+
+          state_schema="$(state_value schema)"
+          state_tag="$(state_value tag)"
+          state_version="$(state_value version)"
+          state_revision="$(state_value revision)"
+          state_digest="$(state_value digest)"
+          state_ghcr_image="$(state_value ghcr_image)"
+          state_dockerhub_enabled="$(state_value dockerhub_enabled)"
+          state_dockerhub_image="$(state_value dockerhub_image)"
+
+          if [[ "${state_schema}" != '1' ||
+                "${state_tag}" != "${tag}" ||
+                "${state_version}" != "${version}" ||
+                ! "${state_revision}" =~ ^[0-9a-f]{40,64}$ ||
+                "${state_ghcr_image}" != "${GHCR_IMAGE}" ||
+                ! "${state_digest}" =~ ^sha256:[0-9a-f]{64}$ ||
+                ("${state_dockerhub_enabled}" != 'true' && "${state_dockerhub_enabled}" != 'false') ]]; then
+            echo "::error::Release ${tag} has invalid latest reconciliation state."
+            cat "${state_file}" >&2
+            exit 1
+          fi
+
+          if [[ "${state_dockerhub_enabled}" == 'true' ]]; then
+            if [[ "${CURRENT_DOCKERHUB_ENABLED}" != 'true' ||
+                  "${CURRENT_DOCKERHUB_IMAGE}" != "${state_dockerhub_image}" ]]; then
+              echo "::error::Release ${tag} requires Docker Hub ${state_dockerhub_image}, but matching credentials/settings are unavailable."
+              exit 1
+            fi
+          elif [[ -n "${state_dockerhub_image}" ]]; then
+            echo "::error::Release ${tag} disables Docker Hub but records a non-empty image."
+            exit 1
+          fi
+
+          {
+            echo 'found=true'
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "digest=${state_digest}"
+            echo "dockerhub_enabled=${state_dockerhub_enabled}"
+            echo "dockerhub_image=${state_dockerhub_image}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        if: steps.desired.outputs.found == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.desired.outputs.found == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: >-
+          steps.desired.outputs.found == 'true' &&
+          steps.desired.outputs.dockerhub_enabled == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ steps.registry.outputs.dockerhub_username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install cosign
+        if: steps.desired.outputs.found == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify release image signatures
+        if: steps.desired.outputs.found == 'true'
+        env:
+          TAG: ${{ steps.desired.outputs.tag }}
+          DIGEST: ${{ steps.desired.outputs.digest }}
+          DOCKERHUB_ENABLED: ${{ steps.desired.outputs.dockerhub_enabled }}
+          DOCKERHUB_IMAGE: ${{ steps.desired.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+          verify() {
+            cosign verify \
+              --certificate-identity "${identity}" \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              "$1" >/dev/null
+          }
+
+          verify "${GHCR_IMAGE}@${DIGEST}"
+          if [[ "${DOCKERHUB_ENABLED}" == 'true' ]]; then
+            verify "${DOCKERHUB_IMAGE}@${DIGEST}"
+          fi
+
+      - name: Reconcile registry latest tags
+        if: steps.desired.outputs.found == 'true'
+        env:
+          DIGEST: ${{ steps.desired.outputs.digest }}
+          DOCKERHUB_ENABLED: ${{ steps.desired.outputs.dockerhub_enabled }}
+          DOCKERHUB_IMAGE: ${{ steps.desired.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          verify_ref() {
+            local ref="$1"
+            local expected_digest="$2"
+            local attempts=7
+            local delay_seconds=2
+            local inspect_error="${RUNNER_TEMP}/latest-inspect.err"
+            local manifest_json=''
+            local observed_digest=''
+            local platforms=''
+
+            for attempt in $(seq 1 "${attempts}"); do
+              if manifest_json="$(
+                timeout --kill-after=5s 30s \
+                  docker buildx imagetools inspect "${ref}" \
+                  --format '{{json .Manifest}}' 2> "${inspect_error}"
+              )"; then
+                if jq -e 'type == "object" and (.digest | type == "string") and (.manifests | type == "array")' \
+                  >/dev/null <<< "${manifest_json}"; then
+                  observed_digest="$(jq -r '.digest // empty' <<< "${manifest_json}")"
+                  platforms="$(
+                    jq -r '[.manifests[].platform
+                      | select(.os == "linux" and (.architecture == "amd64" or .architecture == "arm64"))
+                      | "\(.os)/\(.architecture)"]
+                      | unique | sort | join(",")' <<< "${manifest_json}"
+                  )"
+                  if [[ "${observed_digest}" == "${expected_digest}" && "${platforms}" == 'linux/amd64,linux/arm64' ]]; then
+                    return 0
+                  fi
+                  {
+                    echo "Image has not converged: ${ref}"
+                    echo "Expected digest: ${expected_digest}"
+                    echo "Observed digest: ${observed_digest:-<empty>}"
+                    echo "Observed platforms: ${platforms:-<empty>}"
+                  } > "${inspect_error}"
+                fi
+              fi
+
+              if [[ "${attempt}" -eq "${attempts}" ]]; then
+                echo "::error::Could not verify ${ref} after ${attempts} attempts."
+                cat "${inspect_error}" >&2
+                return 1
+              fi
+              sleep "${delay_seconds}"
+              delay_seconds=$((delay_seconds * 2))
+              if ((delay_seconds > 30)); then
+                delay_seconds=30
+              fi
+            done
+          }
+
+          reconcile() {
+            local label="$1"
+            local image="$2"
+            local metadata_file="${RUNNER_TEMP}/latest-${label}.json"
+            local created_digest=''
+
+            verify_ref "${image}@${DIGEST}" "${DIGEST}"
+            timeout --kill-after=10s 5m docker buildx imagetools create \
+              --metadata-file "${metadata_file}" \
+              --tag "${image}:latest" \
+              "${image}@${DIGEST}"
+            created_digest="$(jq -r '."containerimage.descriptor".digest // empty' "${metadata_file}")"
+            if [[ "${created_digest}" != "${DIGEST}" ]]; then
+              echo "::error::latest promotion for ${image} changed digest: expected ${DIGEST}, got ${created_digest:-<empty>}"
+              exit 1
+            fi
+            verify_ref "${image}:latest" "${DIGEST}"
+          }
+
+          if [[ "${DOCKERHUB_ENABLED}" == 'true' ]]; then
+            reconcile dockerhub "${DOCKERHUB_IMAGE}"
+          fi
+          reconcile ghcr "${GHCR_IMAGE}"
+
+      - name: Mark GitHub Release as latest
+        if: steps.desired.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.desired.outputs.tag }}
+        run: gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --latest
+
+      - name: Summarize reconciliation
+        if: always()
+        env:
+          FOUND: ${{ steps.desired.outputs.found }}
+          TAG: ${{ steps.desired.outputs.tag }}
+          DIGEST: ${{ steps.desired.outputs.digest }}
+        shell: bash
+        run: |
+          {
+            echo '### latest reconciliation'
+            echo
+            echo "- Stable release found: \`${FOUND:-false}\`"
+            if [[ "${FOUND}" == 'true' ]]; then
+              echo "- Release: \`${TAG}\`"
+              echo "- Digest: \`${DIGEST}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

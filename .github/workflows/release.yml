@@ -1,0 +1,624 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Tagged releases publish binary archives plus one linux/amd64 + linux/arm64
+# OCI image, then propose the matching Homebrew formula to orca-ae/homebrew-tap.
+# GHCR is mandatory; Docker Hub is an optional mirror that needs credentials and
+# an explicit namespace. reconcile-latest.yml owns mutable latest aliases.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  # Serialize retries of one tag without dropping pending releases for other
+  # tags. A separate reconciler computes latest from all published releases.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'orca-ae/orca-cli'
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: release_metadata
+        shell: bash
+        run: ./scripts/release-metadata.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve Docker Hub settings
+        id: registry
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_NAMESPACE }}
+        shell: bash
+        run: ./scripts/dockerhub-metadata.sh >> "${GITHUB_OUTPUT}"
+
+      # A draft release is the durable retry boundary. Once an image digest is
+      # built it is uploaded as image-digests.txt; reruns reuse that digest and
+      # continue smoke/sign/promotion instead of producing a new attestation
+      # digest and colliding with partially promoted tags.
+      - name: Prepare or resume draft GitHub release
+        id: release_draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_metadata.outputs.tag }}
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+          REVISION: ${{ steps.release_metadata.outputs.revision }}
+          STABLE: ${{ steps.release_metadata.outputs.stable }}
+          DOCKERHUB_ENABLED: ${{ steps.registry.outputs.credentials }}
+          DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set +e
+          release_json="$(
+            gh release view "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets,isDraft,isPrerelease,tagName \
+              2> "${RUNNER_TEMP}/release-view.err"
+          )"
+          rc=$?
+          set -e
+
+          if [[ "${rc}" -eq 0 ]]; then
+            if [[ "$(jq -r '.isDraft' <<< "${release_json}")" != 'true' ]]; then
+              echo "::error::Published GitHub Release ${TAG} already exists; refusing to overwrite it."
+              exit 1
+            fi
+
+            state_asset_count="$(
+              jq '[.assets[] | select(.name == "image-digests.txt")] | length' \
+                <<< "${release_json}"
+            )"
+            if [[ "${state_asset_count}" -gt 1 ]]; then
+              echo "::error::Draft release ${TAG} contains duplicate image-digests.txt assets."
+              exit 1
+            fi
+
+            if [[ "${state_asset_count}" -eq 1 ]]; then
+              state_dir="${RUNNER_TEMP}/release-state"
+              mkdir -p "${state_dir}"
+              gh release download "${TAG}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --pattern image-digests.txt \
+                --dir "${state_dir}"
+              state_file="${state_dir}/image-digests.txt"
+
+              state_value() {
+                local key="$1"
+                awk -F= -v key="${key}" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' \
+                  "${state_file}"
+              }
+
+              state_schema="$(state_value schema)"
+              state_tag="$(state_value tag)"
+              state_version="$(state_value version)"
+              state_revision="$(state_value revision)"
+              state_digest="$(state_value digest)"
+              state_ghcr_image="$(state_value ghcr_image)"
+              state_dockerhub_enabled="$(state_value dockerhub_enabled)"
+              state_dockerhub_image="$(state_value dockerhub_image)"
+
+              if [[ "${state_schema}" != '1' ||
+                    "${state_tag}" != "${TAG}" ||
+                    "${state_version}" != "${VERSION}" ||
+                    "${state_revision}" != "${REVISION}" ||
+                    "${state_ghcr_image}" != "${GHCR_IMAGE}" ||
+                    "${state_dockerhub_enabled}" != "${DOCKERHUB_ENABLED}" ||
+                    "${state_dockerhub_image}" != "${DOCKERHUB_IMAGE}" ||
+                    ! "${state_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "::error::Draft release ${TAG} has incompatible or invalid image state."
+                cat "${state_file}" >&2
+                exit 1
+              fi
+
+              expected_assets=(
+                checksums.txt
+                "ork_${TAG}_linux_amd64.tar.gz"
+                "ork_${TAG}_linux_arm64.tar.gz"
+                "ork_${TAG}_darwin_amd64.tar.gz"
+                "ork_${TAG}_darwin_arm64.tar.gz"
+                "ork_${TAG}_windows_amd64.zip"
+                "ork_${TAG}_windows_arm64.zip"
+              )
+              for asset in "${expected_assets[@]}"; do
+                if ! jq -e --arg name "${asset}" '.assets[] | select(.name == $name)' \
+                  >/dev/null <<< "${release_json}"; then
+                  echo "::error::Draft release ${TAG} is missing required asset ${asset}."
+                  exit 1
+                fi
+              done
+
+              {
+                echo 'resume=true'
+                echo "digest=${state_digest}"
+              } >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          else
+            lookup_error="$(cat "${RUNNER_TEMP}/release-view.err")"
+            if [[ "${lookup_error}" != 'release not found' ]]; then
+              echo "::error::Could not determine whether GitHub Release ${TAG} exists."
+              printf '%s\n' "${lookup_error}" >&2
+              exit 1
+            fi
+
+            release_args=(
+              --repo "${GITHUB_REPOSITORY}"
+              --draft
+              --title "${TAG}"
+              --generate-notes
+              --verify-tag
+            )
+            if [[ "${STABLE}" != 'true' ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "${TAG}" "${release_args[@]}"
+          fi
+
+          echo 'resume=false' >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Go
+        if: steps.release_draft.outputs.resume != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate release helpers
+        if: steps.release_draft.outputs.resume != 'true'
+        shell: bash
+        run: |
+          ./tests/release-metadata.sh
+          ./tests/dockerhub-metadata.sh
+          ./tests/homebrew-formula.sh
+
+      - name: Run tests
+        if: steps.release_draft.outputs.resume != 'true'
+        run: go test ./...
+
+      - name: Build release artifacts
+        if: steps.release_draft.outputs.resume != 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.release_metadata.outputs.tag }}
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+        run: ./scripts/build-release-archives.sh "${TAG}" "${VERSION}"
+
+      - name: Upload binary assets to draft release
+        if: steps.release_draft.outputs.resume != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_metadata.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" dist/ork_* dist/checksums.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.registry.outputs.credentials == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ steps.registry.outputs.dockerhub_username }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Push only by digest first. User-facing version/latest tags are created
+      # after both architectures pass smoke tests and the digest is signed.
+      - name: Set digest-only image export
+        if: steps.release_draft.outputs.resume != 'true'
+        id: image_export
+        env:
+          DOCKERHUB_ENABLED: ${{ steps.registry.outputs.credentials }}
+          DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_names="${GHCR_IMAGE}"
+          if [[ "${DOCKERHUB_ENABLED}" == 'true' ]]; then
+            image_names="${image_names},${DOCKERHUB_IMAGE}"
+          fi
+          printf 'output=type=image,"name=%s",push-by-digest=true,name-canonical=true,push=true\n' \
+            "${image_names}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push image
+        if: steps.release_draft.outputs.resume != 'true'
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          outputs: ${{ steps.image_export.outputs.output }}
+          build-args: |
+            ORCA_CLI_VERSION=${{ steps.release_metadata.outputs.version }}
+            ORCA_CLI_REVISION=${{ steps.release_metadata.outputs.revision }}
+          cache-from: type=gha,scope=release-orca-cli
+          cache-to: type=gha,mode=max,scope=release-orca-cli
+          provenance: true
+          sbom: true
+
+      - name: Resolve and persist image digest
+        id: image_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME: ${{ steps.release_draft.outputs.resume }}
+          RESUME_DIGEST: ${{ steps.release_draft.outputs.digest }}
+          BUILT_DIGEST: ${{ steps.image.outputs.digest }}
+          TAG: ${{ steps.release_metadata.outputs.tag }}
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+          REVISION: ${{ steps.release_metadata.outputs.revision }}
+          DOCKERHUB_ENABLED: ${{ steps.registry.outputs.credentials }}
+          DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          digest="${BUILT_DIGEST}"
+          if [[ "${RESUME}" == 'true' ]]; then
+            digest="${RESUME_DIGEST}"
+          fi
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Release image digest is invalid: ${digest:-<empty>}"
+            exit 1
+          fi
+
+          if [[ "${RESUME}" != 'true' ]]; then
+            state_file="dist/image-digests.txt"
+            cat > "${state_file}" <<EOF
+          schema=1
+          tag=${TAG}
+          version=${VERSION}
+          revision=${REVISION}
+          digest=${digest}
+          ghcr_image=${GHCR_IMAGE}
+          dockerhub_enabled=${DOCKERHUB_ENABLED}
+          dockerhub_image=${DOCKERHUB_IMAGE}
+          EOF
+            gh release upload "${TAG}" "${state_file}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          fi
+
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate existing version image tags
+        env:
+          DIGEST: ${{ steps.image_state.outputs.digest }}
+          RAW_TAG: ${{ steps.release_metadata.outputs.tag }}
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+          DOCKERHUB_ENABLED: ${{ steps.registry.outputs.credentials }}
+          DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_tag() {
+            local ref="$1"
+            local inspect_output=''
+            local rc=0
+            local existing_digest=''
+
+            set +e
+            inspect_output="$(
+              timeout --kill-after=5s 30s docker buildx imagetools inspect "${ref}" \
+                --format '{{json .Manifest}}' 2>&1
+            )"
+            rc=$?
+            set -e
+
+            if [[ "${rc}" -eq 0 ]]; then
+              if ! jq -e 'type == "object" and (.digest | type == "string")' \
+                >/dev/null <<< "${inspect_output}"; then
+                echo "::error::Registry returned invalid manifest JSON for ${ref}."
+                printf '%s\n' "${inspect_output}" >&2
+                exit 1
+              fi
+              existing_digest="$(jq -r '.digest' <<< "${inspect_output}")"
+              if [[ "${existing_digest}" != "${DIGEST}" ]]; then
+                echo "::error::Image tag ${ref} already points to ${existing_digest}, not release digest ${DIGEST}."
+                exit 1
+              fi
+              echo "Image tag ${ref} already points to the resumable release digest."
+              return 0
+            fi
+
+            if [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]; then
+              echo "::error::Timed out while checking image tag ${ref}; refusing to assume it is absent."
+              exit 1
+            fi
+            if grep -Eiq '(: not found|manifest unknown|no such manifest)[[:space:]]*$' \
+              <<< "${inspect_output}"; then
+              return 0
+            fi
+
+            echo "::error::Could not determine whether image tag ${ref} exists; refusing to overwrite it."
+            printf '%s\n' "${inspect_output}" >&2
+            exit 1
+          }
+
+          refs=("${GHCR_IMAGE}:${RAW_TAG}" "${GHCR_IMAGE}:${VERSION}")
+          if [[ "${DOCKERHUB_ENABLED}" == 'true' ]]; then
+            refs+=("${DOCKERHUB_IMAGE}:${VERSION}")
+          fi
+          for ref in "${refs[@]}"; do
+            check_tag "${ref}"
+          done
+
+      - name: Smoke test pushed image
+        env:
+          DIGEST: ${{ steps.image_state.outputs.digest }}
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Image build returned an invalid digest: ${DIGEST:-<empty>}"
+            exit 1
+          fi
+
+          for platform in linux/amd64 linux/arm64; do
+            image="${GHCR_IMAGE}@${DIGEST}"
+            help_output="$(docker run --rm --platform "${platform}" "${image}" --help)"
+            grep -Fq 'Manage and interact with resources in Orca Agent Engine' <<< "${help_output}"
+            test "$(docker run --rm --platform "${platform}" "${image}" --version)" = "ork version ${VERSION}"
+            runtime_identity="$(
+              docker run --rm --platform "${platform}" --entrypoint /bin/sh "${image}" -ec \
+                'test -w "$HOME"; command -v ork >/dev/null; test -f /usr/share/doc/ork/LICENSE; test -d /usr/share/doc/ork/THIRD_PARTY_LICENSES; printf "%s:%s:%s" "$(id -u)" "$(id -g)" "$HOME"'
+            )"
+            test "${runtime_identity}" = '1000:1000:/home/orca'
+            docker image rm "${image}" >/dev/null 2>&1 || true
+          done
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign GHCR image
+        env:
+          DIGEST: ${{ steps.image_state.outputs.digest }}
+        run: cosign sign --yes "${GHCR_IMAGE}@${DIGEST}"
+
+      - name: Sign Docker Hub image
+        if: steps.registry.outputs.credentials == 'true'
+        env:
+          DIGEST: ${{ steps.image_state.outputs.digest }}
+          DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        run: cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST}"
+
+      - name: Promote verified image tags
+        env:
+          DIGEST: ${{ steps.image_state.outputs.digest }}
+          RAW_TAG: ${{ steps.release_metadata.outputs.tag }}
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+          STABLE: ${{ steps.release_metadata.outputs.stable }}
+          DOCKERHUB_ENABLED: ${{ steps.registry.outputs.credentials }}
+          DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          verify_tag() {
+            local ref="$1"
+            local attempts=7
+            local delay_seconds=2
+            local inspect_error="${RUNNER_TEMP}/imagetools-inspect.err"
+            local manifest_json=''
+            local observed_digest=''
+            local platforms=''
+
+            for attempt in $(seq 1 "${attempts}"); do
+              if manifest_json="$(
+                timeout --kill-after=5s 30s \
+                  docker buildx imagetools inspect "${ref}" \
+                  --format '{{json .Manifest}}' 2> "${inspect_error}"
+              )"; then
+                if jq -e 'type == "object" and (.digest | type == "string") and (.manifests | type == "array")' \
+                  >/dev/null <<< "${manifest_json}"; then
+                  observed_digest="$(jq -r '.digest // empty' <<< "${manifest_json}")"
+                  platforms="$(
+                    jq -r '[.manifests[].platform
+                      | select(.os == "linux" and (.architecture == "amd64" or .architecture == "arm64"))
+                      | "\(.os)/\(.architecture)"]
+                      | unique | sort | join(",")' <<< "${manifest_json}"
+                  )"
+                  if [[ "${observed_digest}" == "${DIGEST}" && "${platforms}" == 'linux/amd64,linux/arm64' ]]; then
+                    return 0
+                  fi
+                  {
+                    echo "Published image has not converged: ${ref}"
+                    echo "Expected digest: ${DIGEST}"
+                    echo "Observed digest: ${observed_digest:-<empty>}"
+                    echo "Observed platforms: ${platforms:-<empty>}"
+                  } > "${inspect_error}"
+                else
+                  printf 'imagetools inspect returned invalid manifest JSON:\n%s\n' \
+                    "${manifest_json}" > "${inspect_error}"
+                fi
+              fi
+
+              if [[ "${attempt}" -eq "${attempts}" ]]; then
+                echo "::error::Could not verify promoted image ${ref} after ${attempts} attempts."
+                cat "${inspect_error}" >&2
+                return 1
+              fi
+
+              sleep "${delay_seconds}"
+              delay_seconds=$((delay_seconds * 2))
+              if ((delay_seconds > 30)); then
+                delay_seconds=30
+              fi
+            done
+          }
+
+          promote() {
+            local label="$1"
+            local image="$2"
+            shift 2
+            local metadata_file="${RUNNER_TEMP}/promotion-${label}.json"
+            local tag_args=()
+            local tag=''
+            local created_digest=''
+
+            for tag in "$@"; do
+              tag_args+=(--tag "${image}:${tag}")
+            done
+
+            timeout --kill-after=10s 5m docker buildx imagetools create \
+              --metadata-file "${metadata_file}" \
+              "${tag_args[@]}" \
+              "${image}@${DIGEST}"
+
+            created_digest="$(jq -r '."containerimage.descriptor".digest // empty' "${metadata_file}")"
+            if [[ "${created_digest}" != "${DIGEST}" ]]; then
+              echo "::error::Promotion for ${image} changed digest: expected ${DIGEST}, got ${created_digest:-<empty>}"
+              exit 1
+            fi
+
+            for tag in "$@"; do
+              verify_tag "${image}:${tag}"
+            done
+          }
+
+          short_sha="${GITHUB_SHA:0:12}"
+          ghcr_tags=("${RAW_TAG}" "${VERSION}" "sha-${short_sha}")
+
+          if [[ "${DOCKERHUB_ENABLED}" == 'true' ]]; then
+            dockerhub_tags=("${VERSION}" "sha-${short_sha}")
+            promote dockerhub "${DOCKERHUB_IMAGE}" "${dockerhub_tags[@]}"
+          fi
+          promote ghcr "${GHCR_IMAGE}" "${ghcr_tags[@]}"
+
+      - name: Publish draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_metadata.outputs.tag }}
+          STABLE: ${{ steps.release_metadata.outputs.stable }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_flags=(--draft=false --title "${TAG}" --verify-tag)
+          if [[ "${STABLE}" == 'true' ]]; then
+            release_flags+=(--prerelease=false --latest=false)
+          else
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release edit "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            "${release_flags[@]}"
+
+      # The formula lands through a pull request on the tap, so a maintainer
+      # merges it; `brew install orca-ae/tap/ork` only works once this
+      # repository's release assets are publicly downloadable.
+      - name: Propose the Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ steps.release_metadata.outputs.tag }}
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TAP_TOKEN}" ]]; then
+            echo '::warning::HOMEBREW_TAP_TOKEN is not configured; skipping the Homebrew formula.'
+            exit 0
+          fi
+
+          work="${RUNNER_TEMP}/homebrew"
+          mkdir -p "${work}"
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern checksums.txt \
+            --dir "${work}" \
+            --clobber
+          ./scripts/homebrew-formula.sh "${TAG}" "${work}/checksums.txt" > "${work}/ork.rb"
+
+          tap_repo=orca-ae/homebrew-tap
+          branch="ork-${VERSION}"
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${tap_repo}.git" "${work}/tap"
+          cd "${work}/tap"
+          git checkout -B "${branch}"
+          mkdir -p Formula
+          cp "${work}/ork.rb" Formula/ork.rb
+          git add Formula/ork.rb
+          if git diff --cached --quiet; then
+            echo "Formula/ork.rb on the tap already describes ${TAG}."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit --quiet --message "ork ${VERSION}"
+          git push --force --quiet origin "${branch}"
+
+          open_prs="$(
+            GH_TOKEN="${TAP_TOKEN}" gh pr list --repo "${tap_repo}" --head "${branch}" \
+              --state open --json number --jq 'length'
+          )"
+          if [[ "${open_prs}" -eq 0 ]]; then
+            GH_TOKEN="${TAP_TOKEN}" gh pr create --repo "${tap_repo}" --head "${branch}" \
+              --title "ork ${VERSION}" \
+              --body "Updates the formula to ork ${TAG} (https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}). Merge it once that release is public: the formula downloads its archives."
+          fi
+
+      - name: Summarize image release
+        if: always()
+        env:
+          VERSION: ${{ steps.release_metadata.outputs.version }}
+          STABLE: ${{ steps.release_metadata.outputs.stable }}
+          DIGEST: ${{ steps.image_state.outputs.digest }}
+          DOCKERHUB_ENABLED: ${{ steps.registry.outputs.credentials }}
+          DOCKERHUB_IMAGE: ${{ steps.registry.outputs.dockerhub_image }}
+        shell: bash
+        run: |
+          {
+            echo '### OCI image release'
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Stable: \`${STABLE}\`"
+            echo "- Platforms: \`linux/amd64,linux/arm64\`"
+            echo "- GHCR: \`${GHCR_IMAGE}\`"
+            echo "- Docker Hub enabled: \`${DOCKERHUB_ENABLED}\`"
+            if [[ "${DOCKERHUB_ENABLED}" == 'true' ]]; then
+              echo "- Docker Hub: \`${DOCKERHUB_IMAGE}\`"
+            fi
+            if [[ -n "${DIGEST}" ]]; then
+              echo "- Digest: \`${DIGEST}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
