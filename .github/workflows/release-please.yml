@@ -1,0 +1,71 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare release
+    if: github.repository == 'orca-ae/orca-cli' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Require release token
+        env:
+          GH_TOKEN: ${{ secrets.SNBOT_GITHUB_TOKEN }}
+        run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::error::SNBOT_GITHUB_TOKEN is required to prepare releases and trigger release workflows."
+            exit 1
+          fi
+
+      # PAT-created PRs trigger CI. Keep the release in draft until release.yml
+      # has built, tested, signed and promoted the artifacts.
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.SNBOT_GITHUB_TOKEN }}
+          target-branch: main
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  tag:
+    name: Trigger artifact release
+    needs: prepare
+    if: needs.prepare.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A separate job allows a failed tag creation to be retried without rerunning
+    # Release Please, which has already marked the release PR as processed.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      # Draft releases do not create tags. Create the tag only AFTER the draft
+      # exists, avoiding a race with release.yml creating the same release.
+      # GITHUB_TOKEN would suppress the tag-triggered workflow.
+      - name: Create release tag
+        env:
+          GH_TOKEN: ${{ secrets.SNBOT_GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag_name }}
+          REVISION: ${{ needs.prepare.outputs.sha }}
+        run: ./scripts/create-release-tag.sh "${TAG}" "${REVISION}"

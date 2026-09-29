@@ -1,0 +1,17 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/orca-ae/orca-cli/discussions/categories/q-a
+    about: Questions about using ork belong in GitHub Discussions.
+  - name: Share an idea or discuss a design
+    url: https://github.com/orca-ae/orca-cli/discussions/categories/ideas
+    about: Open-ended ideas, and designs to discuss before you write code.
+  - name: Report a problem in Orca Agent Engine
+    url: https://github.com/orca-ae/orca-agent-engine/issues/new/choose
+    about: Bugs in the engine itself, rather than in the ork CLI, belong in the engine repository.
+  - name: Report a security vulnerability
+    url: https://github.com/orca-ae/orca-cli/security/advisories/new
+    about: Please report security issues privately, not in a public issue. See SECURITY.md.

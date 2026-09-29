@@ -1,0 +1,118 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# S3 backend for direct Managed Agents E2E.
+#
+# RustFS replaces MinIO here: MinIO withdrew its public images in September
+# 2026 (docker.io/minio/minio returns 404, quay.io/minio/minio returns 401 to
+# anonymous pulls), which broke every topology that pulled them. RustFS is
+# S3-compatible, publicly pullable, and serves the same :9000 API.
+#
+# The `orca-managed-agents-minio*` resource names are deliberately retained:
+# managed-agents-values.yaml pins the object-store endpoint to the Service DNS
+# name, and the deployment script waits on these Deployment/Job names. Only the
+# implementation changed, so the names stay a stable contract.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orca-managed-agents-minio
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: orca-managed-agents-minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orca-managed-agents-minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orca-managed-agents-minio
+    spec:
+      containers:
+        - name: minio
+          image: rustfs/rustfs:1.0.0
+          imagePullPolicy: IfNotPresent
+          # No args: the image entrypoint defaults to `rustfs` and serves
+          # RUSTFS_VOLUMES (/data). No volume is mounted on purpose — the image
+          # prepares /data and /logs for its non-root `rustfs` user, and an
+          # emptyDir would land root-owned without an fsGroup.
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          env:
+            - name: RUSTFS_ACCESS_KEY
+              value: minioadmin
+            - name: RUSTFS_SECRET_KEY
+              value: minioadmin
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: s3
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orca-managed-agents-minio
+  namespace: __NAMESPACE__
+spec:
+  selector:
+    app.kubernetes.io/name: orca-managed-agents-minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: console
+      port: 9001
+      targetPort: console
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orca-managed-agents-minio-init
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: orca-managed-agents-minio
+spec:
+  backoffLimit: 12
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orca-managed-agents-minio-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        # The MinIO client (mc) is gated on quay.io alongside the server, so the
+        # bucket is created with the AWS CLI instead. `s3 mb` is idempotent
+        # against RustFS, matching the `mc mb --ignore-existing` it replaces.
+        - name: minio-client
+          image: amazon/aws-cli:2.36.50
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              until aws --endpoint-url "${S3_ENDPOINT}" s3 ls >/dev/null 2>&1; do
+                sleep 2
+              done
+              aws --endpoint-url "${S3_ENDPOINT}" s3 mb "s3://${S3_BUCKET}"
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: minioadmin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: minioadmin
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: S3_ENDPOINT
+              value: http://orca-managed-agents-minio:9000
+            - name: S3_BUCKET
+              value: orca-files

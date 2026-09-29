@@ -1,0 +1,264 @@
+# Copyright The Orca Authors
+# SPDX-License-Identifier: Apache-2.0
+
+name: E2E - Managed Agents direct
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: e2e-managed-agents-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-gate:
+    name: Check Managed Agents source access
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Decide whether the E2E job can run
+        id: gate
+        env:
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          SNBOT_GITHUB_TOKEN: ${{ secrets.SNBOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" && \
+                "${PR_HEAD_REPOSITORY:-}" != "${GITHUB_REPOSITORY}" ]]; then
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "Skipping internal-source E2E for a fork pull request."
+            exit 0
+          fi
+          if [[ -z "${SNBOT_GITHUB_TOKEN:-}" ]]; then
+            echo "::error::Missing required E2E secret: SNBOT_GITHUB_TOKEN"
+            exit 1
+          fi
+          echo "enabled=true" >> "${GITHUB_OUTPUT}"
+
+  e2e:
+    name: CLI against pinned Managed Agents stack
+    needs: secret-gate
+    if: needs.secret-gate.outputs.enabled == 'true'
+    runs-on: ${{ vars.E2E_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      KIND_CLUSTER_NAME: orca-cli-managed-agents
+      KIND_HELM_NAMESPACE: orca-cli-e2e
+    steps:
+      - name: Check out CLI
+        uses: actions/checkout@v4
+
+      # Failure diagnostics include pod logs, which must not reach a public
+      # repository's run logs. Scheduled runs carry no repository payload, so
+      # read the visibility from the API.
+      - name: Detect repository visibility
+        id: visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "private=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .private)" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve dependency settings
+        id: dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          source tests/e2e/dependencies.env
+          {
+            echo "managed_repository=${ORCA_MANAGED_AGENTS_REPOSITORY}"
+            echo "registry_image=${ORCA_MANAGED_AGENTS_REGISTRY_IMAGE}"
+            echo "harness_image=${ORCA_MANAGED_AGENTS_HARNESS_IMAGE}"
+            echo "image_tag=${ORCA_MANAGED_AGENTS_IMAGE_TAG}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        with:
+          version: v1.31.2
+
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.3
+
+      - name: Install yq
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/yq" \
+            https://github.com/mikefarah/yq/releases/download/v4.33.3/yq_linux_amd64
+          echo "4ee662847c588c3ef2fec8bfb304e8739e3dbaba87ccb9a608d691c88f5b64dc  ${RUNNER_TEMP}/yq" | sha256sum --check --quiet
+          sudo install -m 0755 "${RUNNER_TEMP}/yq" /usr/local/bin/yq
+
+      - name: Install Kind
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/kind" https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          echo "b89aada5a39d620da3fcd16435b7f28d858927dd53f92cbac77686b0588b600d  ${RUNNER_TEMP}/kind" | sha256sum --check --quiet
+          sudo install -m 0755 "${RUNNER_TEMP}/kind" /usr/local/bin/kind
+          kind version
+
+      - name: Resolve pinned Managed Agents Registry image
+        id: registry-image
+        env:
+          SOURCE_IMAGE: ${{ steps.dependencies.outputs.registry_image }}
+          SOURCE_TAG: ${{ steps.dependencies.outputs.image_tag }}
+          IMAGE_COMPONENT: Managed Agents Registry
+        run: tests/e2e/resolve-latest-image.sh
+
+      - name: Resolve pinned Managed Agents Harness image
+        id: harness-image
+        env:
+          SOURCE_IMAGE: ${{ steps.dependencies.outputs.harness_image }}
+          SOURCE_TAG: ${{ steps.dependencies.outputs.image_tag }}
+          IMAGE_COMPONENT: Managed Agents Harness
+        run: tests/e2e/resolve-latest-image.sh
+
+      - name: Resolve matching Managed Agents source revision
+        id: managed-source
+        env:
+          REGISTRY_REVISION: ${{ steps.registry-image.outputs.revision }}
+          HARNESS_REVISION: ${{ steps.harness-image.outputs.revision }}
+        run: |
+          set -euo pipefail
+          [[ "${REGISTRY_REVISION}" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "${REGISTRY_REVISION}" != "${HARNESS_REVISION}" ]]; then
+            echo "::error::Registry and Harness tags come from different source revisions"
+            exit 1
+          fi
+          echo "ref=${REGISTRY_REVISION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out matching Orca Managed Agents source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.dependencies.outputs.managed_repository }}
+          ref: ${{ steps.managed-source.outputs.ref }}
+          path: .e2e/orca-managed-agents
+          token: ${{ secrets.SNBOT_GITHUB_TOKEN }}
+          persist-credentials: false
+
+      - name: Verify Managed Agents source revision
+        env:
+          SOURCE_REVISION: ${{ steps.managed-source.outputs.ref }}
+        run: |
+          set -euo pipefail
+          test "$(git -C .e2e/orca-managed-agents rev-parse HEAD)" = "${SOURCE_REVISION}"
+          {
+            echo "### Managed Agents Helm source"
+            echo
+            echo "- Revision: \`${SOURCE_REVISION}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Build CLI
+        run: go build -o "${RUNNER_TEMP}/ork" ./cmd/ork
+
+      - name: Resolve Chart-pinned AI Gateway image
+        id: gateway-image
+        run: |
+          set -euo pipefail
+          values=.e2e/orca-managed-agents/charts/orca-managed-agents/values.yaml
+          repository=$(yq eval '.images.aiGateway.repository' "${values}")
+          tag=$(yq eval '.images.aiGateway.tag' "${values}")
+          test -n "${repository}"
+          test -n "${tag}"
+          source_image="${repository}:${tag}"
+          echo "source_image=${source_image}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "### AI Gateway compatibility image"
+            echo
+            echo "- Chart pin: \`${source_image}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Build deterministic Anthropic and MCP fixture
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag orca-managed-agents-fixture:e2e \
+            --file .e2e/orca-managed-agents/charts/orca-managed-agents/test/kind/Dockerfile.fixture \
+            .e2e/orca-managed-agents
+
+      - name: Create Kind cluster and load deterministic fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          kind create cluster --name "${KIND_CLUSTER_NAME}" --wait 120s
+          kind load docker-image \
+            --name "${KIND_CLUSTER_NAME}" \
+            orca-managed-agents-fixture:e2e
+
+      - name: Configure GHCR pull access
+        env:
+          GH_TOKEN: ${{ secrets.SNBOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace "${KIND_HELM_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          username=$(gh api user --jq .login)
+          kubectl --namespace "${KIND_HELM_NAMESPACE}" create secret docker-registry orca-e2e-ghcr \
+            --docker-server=ghcr.io \
+            --docker-username="${username}" \
+            --docker-password="${GH_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy Managed Agents with Helm
+        env:
+          MANAGED_AGENTS_CHART_DIR: ${{ github.workspace }}/.e2e/orca-managed-agents/charts/orca-managed-agents
+          MANAGED_AGENTS_NAMESPACE: ${{ env.KIND_HELM_NAMESPACE }}
+          MANAGED_AGENTS_INSTALL_INFRA: "true"
+          MANAGED_AGENTS_REGISTRY_IMAGE: ${{ steps.registry-image.outputs.source_image }}
+          MANAGED_AGENTS_HARNESS_IMAGE: ${{ steps.harness-image.outputs.source_image }}
+          MANAGED_AGENTS_AI_GATEWAY_IMAGE: ${{ steps.gateway-image.outputs.source_image }}
+          MANAGED_AGENTS_FIXTURE_IMAGE: orca-managed-agents-fixture:e2e
+          MANAGED_AGENTS_IMAGE_PULL_SECRET: orca-e2e-ghcr
+        run: tests/e2e/deploy-managed-agents-helm.sh
+
+      - name: Run CLI against Managed Agents
+        env:
+          ORCA_BIN: ${{ runner.temp }}/ork
+        run: tests/e2e/run-managed-agents-direct.sh
+
+      - name: Summarize failure
+        if: (failure() || cancelled()) && steps.visibility.outputs.private != 'true'
+        shell: bash
+        run: |
+          set +e
+          kubectl get namespaces,pods,deployments,services,jobs --all-namespaces -o wide
+          helm --namespace "${KIND_HELM_NAMESPACE}" status orca-managed-agents
+
+      - name: Dump diagnostics
+        if: (failure() || cancelled()) && steps.visibility.outputs.private == 'true'
+        shell: bash
+        run: |
+          set +e
+          kubectl get namespaces,pods,deployments,services,jobs --all-namespaces -o wide
+          helm --namespace "${KIND_HELM_NAMESPACE}" status orca-managed-agents
+          kubectl --namespace "${KIND_HELM_NAMESPACE}" describe pods
+          for deployment in \
+            orca-managed-agents-registry \
+            orca-managed-agents-harness \
+            orca-managed-agents-ai-gateway \
+            orca-managed-agents-fixture; do
+            kubectl --namespace "${KIND_HELM_NAMESPACE}" logs \
+              "deployment/${deployment}" --all-containers=true --tail=300
+          done
+
+      - name: Delete Kind cluster
+        if: always()
+        run: kind delete cluster --name "${KIND_CLUSTER_NAME}"

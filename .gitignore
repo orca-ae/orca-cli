@@ -1,0 +1,10 @@
+/build
+/dist
+/ork
+__pycache__/
+*.pyc
+/.pi
+
+# Local Claude Code state; .claude/settings.json is shared and tracked
+/.claude/worktrees/
+/.claude/settings.local.json
