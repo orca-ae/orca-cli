@@ -91,6 +91,19 @@ as the [README](README.md#quick-start) describes.
   It needs the `SNBOT_GITHUB_TOKEN` repository secret, so it runs on this repository's own branches
   and skips pull requests from forks. [tests/e2e/README.md](tests/e2e/README.md) describes the suite.
 
+### Publishing a release
+
+`release.yml` runs when a `v*.*.*` tag is pushed. It publishes binary archives and container images,
+then opens a formula update pull request in `orca-ae/homebrew-tap`. A maintainer merges that pull
+request before the new version is available through `brew install orca-ae/tap/ork`. This workflow
+does not create release-preparation pull requests or choose the next version automatically.
+
+The Homebrew step uses the `SNBOT_GITHUB_TOKEN` Actions secret available to `orca-ae/orca-cli`.
+The token must have access to `orca-ae/homebrew-tap` with **Contents: read and write** and
+**Pull requests: read and write** permissions. Release assets are downloaded using the CLI
+repository's `GITHUB_TOKEN`; only tap operations use `SNBOT_GITHUB_TOKEN`. If the secret is absent,
+the workflow warns and skips the formula update without failing the release.
+
 ## How the code is organized
 
 | Path                  | What it is                                                               |

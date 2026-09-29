@@ -549,7 +549,7 @@ jobs:
       - name: Propose the Homebrew formula
         env:
           GH_TOKEN: ${{ github.token }}
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_TOKEN: ${{ secrets.SNBOT_GITHUB_TOKEN }}
           TAG: ${{ steps.release_metadata.outputs.tag }}
           VERSION: ${{ steps.release_metadata.outputs.version }}
         shell: bash
@@ -557,7 +557,7 @@ jobs:
           set -euo pipefail
 
           if [[ -z "${TAP_TOKEN}" ]]; then
-            echo '::warning::HOMEBREW_TAP_TOKEN is not configured; skipping the Homebrew formula.'
+            echo '::warning::SNBOT_GITHUB_TOKEN is not configured; skipping the Homebrew formula.'
             exit 0
           fi
 
