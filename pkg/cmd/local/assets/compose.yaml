@@ -124,6 +124,7 @@ services:
       S3_ACCESS_KEY_ID: orca-local
       S3_SECRET_ACCESS_KEY: orca-local-secret
       AI_GATEWAY_URL: http://ai-gateway:8090
+      LLM_GATEWAY_URL: http://ai-gateway:8090/v1
       LLM_EGRESS_DEFAULT: ${ORCA_LOCAL_LLM_EGRESS:-direct}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

@@ -91,6 +91,46 @@ func TestEmbeddedComposeIsValid(t *testing.T) {
 			t.Fatalf("Compose config missing %q", required)
 		}
 	}
+	assertHarnessGatewayURLs(t, output)
+	output, err = s.composeOutput([]string{"ORCA_LOCAL_LLM_EGRESS=gateway"}, "--profile", "gateway", "config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHarnessGatewayURLs(t, output)
+}
+
+// Keep this regression check independent of Docker so it also runs when the
+// Compose validation above is skipped. Harness reads separate MCP and LLM URLs.
+func TestPreparedComposeHarnessGatewayURLs(t *testing.T) {
+	s := &stack{dir: t.TempDir()}
+	if err := s.prepare(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.dir, "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHarnessGatewayURLs(t, data)
+}
+
+func assertHarnessGatewayURLs(t *testing.T, data []byte) {
+	t.Helper()
+	var config struct {
+		Services map[string]struct {
+			Environment map[string]string `json:"environment"`
+		} `json:"services"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"AI_GATEWAY_URL":  "http://ai-gateway:8090",
+		"LLM_GATEWAY_URL": "http://ai-gateway:8090/v1",
+	} {
+		if got := config.Services["harness"].Environment[key]; got != want {
+			t.Errorf("harness.environment.%s = %q, want %q", key, got, want)
+		}
+	}
 }
 
 // Compose v5 writes "Container ... Creating" progress to stderr even for
