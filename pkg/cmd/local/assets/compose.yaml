@@ -53,7 +53,7 @@ services:
     restart: "no"
 
   migrate:
-    image: ${ORCA_LOCAL_REGISTRY_IMAGE:-docker.io/streamnative/orca-registry-service-ts@sha256:5d309fe8cdd3200f8e3392344bfe8d2f2b369960938cb3d09bc4c62a67aa35ce}
+    image: ${ORCA_LOCAL_REGISTRY_IMAGE:-ghcr.io/orca-ae/orca-registry-service-ts:0.5.1}
     command: [node, dist/migrate.js]
     environment:
       DATABASE_URL: postgres://orca:orca@postgres:5432/registry
@@ -63,7 +63,7 @@ services:
     restart: "no"
 
   registry:
-    image: ${ORCA_LOCAL_REGISTRY_IMAGE:-docker.io/streamnative/orca-registry-service-ts@sha256:5d309fe8cdd3200f8e3392344bfe8d2f2b369960938cb3d09bc4c62a67aa35ce}
+    image: ${ORCA_LOCAL_REGISTRY_IMAGE:-ghcr.io/orca-ae/orca-registry-service-ts:0.5.1}
     environment:
       NODE_ENV: development
       HTTP_PORT: "8080"
@@ -79,6 +79,9 @@ services:
       SESSION_JWT_PRIVATE_KEY_PEM: /run/secrets/session-jwt-private
       SESSION_JWT_ISSUER: orca-registry
       SESSION_JWT_AUDIENCE: ai-gateway
+      SESSION_JWT_LLM_ROUTES: llm-messages,llm-responses,llm-chat
+      # Registry narrows the policy to each session's pinned agent models.
+      SESSION_JWT_LLM_MODELS: "*"
       ORCA_SECRET_STORE_MODE: local
       S3_ENDPOINT: http://rustfs:9000
       S3_FORCE_PATH_STYLE: "true"
@@ -106,7 +109,7 @@ services:
         condition: service_completed_successfully
 
   harness:
-    image: ${ORCA_LOCAL_HARNESS_IMAGE:-docker.io/streamnative/orca-harness-server@sha256:5f783231660b4b65f3986ff4fb9712571fb0b2339b378cbcb246654a07c2a8f9}
+    image: ${ORCA_LOCAL_HARNESS_IMAGE:-ghcr.io/orca-ae/orca-harness-server:0.5.1}
     environment:
       NODE_ENV: development
       HTTP_PORT: "9094"
@@ -140,7 +143,7 @@ services:
 
   ai-gateway:
     profiles: [gateway]
-    image: ${ORCA_LOCAL_GATEWAY_IMAGE:-ghcr.io/orca-ae/orca-ai-gateway:v0.4.2-rc.1}
+    image: ${ORCA_LOCAL_GATEWAY_IMAGE:-ghcr.io/orca-ae/orca-ai-gateway:0.4.3}
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}

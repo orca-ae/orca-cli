@@ -33,6 +33,7 @@ vaults:
     env_var: DEEPSEEK_API_KEY
   - name: anthropic_api_key
     resolver: env
+    env_var: ANTHROPIC_API_KEY
   - name: registry-vaults
     resolver: http
     url_template: 'http://registry:8081/internal/v1/workspaces/{scope.workspace_id}/sessions/{scope.session_id}/vault-credentials/{credential_id}/resolve'
