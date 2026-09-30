@@ -12,7 +12,9 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
     healthcheck:
-      test: [CMD, pg_isready, -U, orca]
+      # The entrypoint's temporary init server only listens on a Unix socket.
+      # Wait for the final TCP server before allowing migrations to start.
+      test: [CMD, pg_isready, -h, 127.0.0.1, -p, '5432', -U, orca, -d, registry]
       interval: 2s
       timeout: 2s
       retries: 30
