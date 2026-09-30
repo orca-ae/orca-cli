@@ -27,18 +27,17 @@ import (
 	"time"
 )
 
-// Options configures an authorization-code flow with public or Basic client authentication. Zero Timeout uses
-// five minutes; empty CallbackAddress uses an ephemeral 127.0.0.1 port.
-// ClientID skips dynamic registration; ClientSecret enables Basic authentication
-// for a pre-registered client. Issuer pins the expected identity while a sole
-// advertised OAuth proxy remains the metadata discovery location.
-// NoRefresh only suppresses refresh requests;
-// a refresh token returned by the server is still included in the result.
+// Options configures an authorization-code flow with public clients or dynamically
+// registered Basic clients. Zero Timeout uses five minutes; empty CallbackAddress
+// uses an ephemeral 127.0.0.1 port. ClientID skips dynamic registration for a public
+// client. Issuer pins the expected identity while a sole advertised OAuth proxy
+// remains the metadata discovery location. NoRefresh only suppresses refresh
+// requests; a refresh token returned by the server is still included in the result.
 type Options struct {
-	ServerURL, Issuer, ClientID, ClientSecret, CallbackAddress string
-	Scopes                                                     []string
-	Timeout                                                    time.Duration
-	NoBrowser, NoRefresh, AllowHTTP                            bool
+	ServerURL, Issuer, ClientID, CallbackAddress string
+	Scopes                                       []string
+	Timeout                                      time.Duration
+	NoBrowser, NoRefresh, AllowHTTP              bool
 }
 
 func defaults(o Options) Options {
@@ -62,9 +61,6 @@ func ValidateOptions(o Options) error {
 		if err := checkIssuer(o.Issuer, o.AllowHTTP); err != nil {
 			return err
 		}
-	}
-	if o.ClientSecret != "" && o.ClientID == "" {
-		return errors.New("OAuth client secret requires a pre-registered client ID")
 	}
 	if o.Timeout < 0 {
 		return errors.New("OAuth timeout must be positive")
@@ -234,7 +230,7 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 	served := make(chan struct{})
 	go func() { defer close(served); _ = srv.Serve(ln) }()
 	defer func() { _ = srv.Close(); _ = ln.Close(); <-served }()
-	client := oauthClient{id: opts.ClientID, secret: opts.ClientSecret, method: cfg.tokenAuthMethod}
+	client := oauthClient{id: opts.ClientID, method: cfg.tokenAuthMethod}
 	if client.id == "" {
 		fmt.Fprintln(progress, "Registering OAuth client")
 		client, err = f.register(ctx, cfg, redirect)

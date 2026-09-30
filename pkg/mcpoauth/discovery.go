@@ -303,16 +303,11 @@ func (f *flow) discover(ctx context.Context) (config, error) {
 	if _, exists := m["token_endpoint_auth_methods_supported"]; !exists {
 		methods = []string{"client_secret_basic"}
 	}
-	if f.opts.ClientSecret != "" {
-		if !contains(methods, "client_secret_basic") {
-			return c, errors.New("authorization server does not support client_secret_basic")
-		}
-		c.tokenAuthMethod = "client_secret_basic"
-	} else if contains(methods, "none") {
+	if contains(methods, "none") {
 		c.tokenAuthMethod = "none"
 	} else if contains(methods, "client_secret_basic") {
 		if f.opts.ClientID != "" {
-			return c, errors.New("pre-registered OAuth client requires a client secret")
+			return c, errors.New("pre-registered Basic clients are not supported; omit --oauth-client-id to use dynamic registration")
 		}
 		c.tokenAuthMethod = "client_secret_basic"
 	} else {

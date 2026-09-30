@@ -283,12 +283,11 @@ authentication (`none`) when advertised, and otherwise supports `client_secret_b
 authentication, the registration response must supply a client secret; the CLI uses it for the
 token exchange and includes it in the vault's refresh settings without printing or caching it.
 
-For a pre-registered client, pass `--oauth-client-id <id>` and configure its redirect URI as
+For a pre-registered public client, pass `--oauth-client-id <id>` and configure its redirect URI as
 `http://127.0.0.1:<port>/oauth/callback`, selecting that port with `--callback-address`. The
 provider must accept this exact redirect URI (or explicitly permit dynamic loopback ports).
-A pre-registered Basic client also needs `--oauth-client-secret-file <path>`. The file contains only
-the secret, optionally followed by a line ending, keeping it out of process arguments and help text.
-Client-credentials grants and other token endpoint authentication methods are not supported.
+Basic client credentials are obtained through dynamic registration. Pre-registered confidential
+clients, client-credentials grants, and other token endpoint authentication methods are not supported.
 
 OAuth proxies sometimes publish one discovery location in protected-resource metadata while their
 authorization-server metadata identifies an upstream issuer. The default flow rejects that

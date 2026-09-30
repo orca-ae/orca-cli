@@ -66,7 +66,7 @@ func TestAuthorizePinnedProxyStillChecksCallbackIssuer(t *testing.T) {
 }
 
 func TestAuthorizeBasicClientAuthentication(t *testing.T) {
-	for _, stage := range []string{"dynamic", "pre-registered", "metadata default", "registration default", "pinned proxy"} {
+	for _, stage := range []string{"dynamic", "metadata default", "registration default", "pinned proxy"} {
 		t.Run(stage, func(t *testing.T) {
 			var f *oauthFixture
 			if stage == "pinned proxy" {
@@ -82,9 +82,6 @@ func TestAuthorizeBasicClientAuthentication(t *testing.T) {
 			f.expectedBasicID = "client:id +space"
 			f.expectedBasicSecret = "client-secret:+ &space"
 			opts := f.options()
-			if stage == "pre-registered" {
-				opts.ClientID, opts.ClientSecret = f.expectedBasicID, f.expectedBasicSecret
-			}
 			if stage == "metadata default" {
 				delete(f.metadata, "token_endpoint_auth_methods_supported")
 			}
@@ -107,11 +104,7 @@ func TestAuthorizeBasicClientAuthentication(t *testing.T) {
 			if refresh["resource"] != f.server.URL || len(f.exchanges) != 1 {
 				t.Fatal("resource binding or token exchange missing")
 			}
-			if stage == "pre-registered" {
-				if len(f.registered) != 0 {
-					t.Fatal("pre-registered client invoked dynamic registration")
-				}
-			} else if len(f.registered) != 1 || f.registered[0]["token_endpoint_auth_method"] != "client_secret_basic" {
+			if len(f.registered) != 1 || f.registered[0]["token_endpoint_auth_method"] != "client_secret_basic" {
 				t.Fatal("dynamic registration did not request Basic client authentication")
 			}
 			for _, secret := range []string{f.expectedBasicSecret, "access-secret", "refresh-secret", "code-secret", f.exchanges[0].Get("code_verifier")} {
@@ -154,20 +147,14 @@ func TestAuthorizeBasicRegistrationRequiresSecret(t *testing.T) {
 	}
 }
 
-func TestAuthorizeBasicPreRegisteredClientRequiresSecret(t *testing.T) {
+func TestAuthorizePreRegisteredBasicClientRejectsBeforeRegistration(t *testing.T) {
 	f := newOAuthFixture(t)
 	f.metadata["token_endpoint_auth_methods_supported"] = []string{"client_secret_basic"}
 	opts := f.options()
 	opts.ClientID = "registered-client"
 	_, err := authorize(context.Background(), opts, io.Discard, testBrowser)
-	if err == nil || !strings.Contains(err.Error(), "requires a client secret") || len(f.registered) != 0 {
+	if err == nil || !strings.Contains(err.Error(), "pre-registered Basic clients are not supported") || len(f.registered) != 0 || len(f.exchanges) != 0 {
 		t.Fatalf("unexpected validation result: %v", err)
-	}
-}
-
-func TestClientSecretRequiresClientID(t *testing.T) {
-	if err := ValidateOptions(Options{ServerURL: "https://mcp.example.com/mcp", ClientSecret: "private-secret"}); err == nil {
-		t.Fatal("client secret without client ID was accepted")
 	}
 }
 
