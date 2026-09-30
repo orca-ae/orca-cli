@@ -342,6 +342,10 @@ key's path rather than its value. Without `--data-dir`, the directory is `ork/lo
 user configuration directory. `stop` keeps the Postgres and RustFS Docker volumes and the local key
 files.
 
+The default engine images are `ghcr.io/orca-ae/orca-registry-service-ts:0.5.1` (Registry and
+migrations), `ghcr.io/orca-ae/orca-harness-server:0.5.1`, and
+`ghcr.io/orca-ae/orca-ai-gateway:0.4.3` for the optional gateway.
+
 The CLI doesn't save provider credentials. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in the shell
 before `ork local start` to pass them to Harness, and restart the stack after you change them.
 
