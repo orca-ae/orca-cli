@@ -242,25 +242,38 @@ func (f *flow) discover(ctx context.Context) (config, error) {
 			return c, e
 		}
 	}
-	if f.opts.Issuer != "" {
-		if len(servers) > 0 && !contains(servers, f.opts.Issuer) {
-			return c, errors.New("issuer must match a protected-resource authorization server")
-		}
-		c.issuer = f.opts.Issuer
-	} else {
-		if len(servers) > 1 {
+	// A sole advertised server also identifies the discovery location. A
+	// trusted explicit issuer can pin its identity when an OAuth proxy hosts
+	// metadata at a different URL. Never accept a mismatch automatically.
+	discoveryIssuer := origin(server)
+	if len(servers) == 1 {
+		discoveryIssuer = servers[0]
+	}
+	if len(servers) > 1 {
+		if f.opts.Issuer == "" {
 			return c, errors.New("multiple authorization servers; specify an issuer")
 		}
-		c.issuer = origin(server)
-		if len(servers) == 1 {
-			c.issuer = servers[0]
+		if !contains(servers, f.opts.Issuer) {
+			return c, errors.New("issuer must select a protected-resource authorization server")
+		}
+		discoveryIssuer = f.opts.Issuer
+	}
+	c.issuer = discoveryIssuer
+	if f.opts.Issuer != "" {
+		c.issuer = f.opts.Issuer
+		if len(servers) == 0 {
+			discoveryIssuer = f.opts.Issuer
 		}
 	}
-	issuer, _ := url.Parse(c.issuer)
+	issuer, _ := url.Parse(discoveryIssuer)
+	proxyOrigin := ""
+	if len(servers) == 1 && f.opts.Issuer != "" && f.opts.Issuer != discoveryIssuer {
+		proxyOrigin = origin(issuer)
+	}
 	issuerPath := strings.TrimRight(issuer.EscapedPath(), "/")
 	candidates = []string{origin(issuer) + "/.well-known/oauth-authorization-server" + issuerPath, origin(issuer) + "/.well-known/openid-configuration" + issuerPath}
 	if issuerPath != "" {
-		candidates = append(candidates, strings.TrimRight(c.issuer, "/")+"/.well-known/oauth-authorization-server", strings.TrimRight(c.issuer, "/")+"/.well-known/openid-configuration")
+		candidates = append(candidates, strings.TrimRight(discoveryIssuer, "/")+"/.well-known/oauth-authorization-server", strings.TrimRight(discoveryIssuer, "/")+"/.well-known/openid-configuration")
 	}
 	m, e := f.metadata(ctx, candidates)
 	if e != nil {
@@ -270,6 +283,9 @@ func (f *flow) discover(ctx context.Context) (config, error) {
 		return c, errors.New("could not discover authorization-server metadata")
 	}
 	if actual, ok := m["issuer"].(string); !ok || actual != c.issuer {
+		if f.opts.Issuer == "" && len(servers) == 1 {
+			return c, errors.New("authorization-server metadata issuer mismatch; use --oauth-issuer to pin a trusted proxy issuer")
+		}
 		return c, errors.New("authorization-server metadata issuer mismatch")
 	}
 	methods, e := stringList(m, "code_challenge_methods_supported")
@@ -283,10 +299,24 @@ func (f *flow) discover(ctx context.Context) (config, error) {
 	if e != nil {
 		return c, e
 	}
-	// RFC 8414 defaults omitted methods to client_secret_basic. This flow
-	// cannot use confidential clients, so require explicit public support.
-	if !contains(methods, "none") {
-		return c, errors.New("authorization server does not support public OAuth clients")
+	// RFC 8414 defaults omitted methods to client_secret_basic.
+	if _, exists := m["token_endpoint_auth_methods_supported"]; !exists {
+		methods = []string{"client_secret_basic"}
+	}
+	if f.opts.ClientSecret != "" {
+		if !contains(methods, "client_secret_basic") {
+			return c, errors.New("authorization server does not support client_secret_basic")
+		}
+		c.tokenAuthMethod = "client_secret_basic"
+	} else if contains(methods, "none") {
+		c.tokenAuthMethod = "none"
+	} else if contains(methods, "client_secret_basic") {
+		if f.opts.ClientID != "" {
+			return c, errors.New("pre-registered OAuth client requires a client secret")
+		}
+		c.tokenAuthMethod = "client_secret_basic"
+	} else {
+		return c, errors.New("authorization server advertises no supported OAuth client authentication")
 	}
 	endpoints := []struct {
 		key string
@@ -306,6 +336,9 @@ func (f *flow) discover(ctx context.Context) (config, error) {
 		u, e := checkedURL(s, f.opts.AllowHTTP)
 		if e != nil {
 			return c, e
+		}
+		if proxyOrigin != "" && origin(u) != proxyOrigin {
+			return c, errors.New("pinned OAuth proxy endpoint points to a different origin")
 		}
 		// Server-supplied query parameters must not smuggle credentials into
 		// progress output or override security-critical authorization parameters.

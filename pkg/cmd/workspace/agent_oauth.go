@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -27,11 +28,12 @@ func (o *agentOptions) newVaultCredentialCreateCommand() *cobra.Command {
 func (o *agentOptions) newVaultCredentialCreateCommandWithOAuth(authorize authorizeMCPOAuth) *cobra.Command {
 	opts := vaultCredentialOptions{output: "text"}
 	oauth := mcpoauth.Options{CallbackAddress: "127.0.0.1:0", Timeout: 5 * time.Minute}
+	var clientSecretFile string
 	cmd := &cobra.Command{
 		Use:   "create --vault <vault-id> (--auth-json <json> | --mcp-server-url <url>)",
 		Short: "Create a vault credential, optionally completing MCP OAuth in the browser",
 		Long: "Create a vault credential from auth JSON, or authorize an MCP server using OAuth " +
-			"discovery, a public client, PKCE, and a loopback browser callback. " +
+			"discovery, public or Basic client authentication, PKCE, and a loopback browser callback. " +
 			"OAuth tokens are sent directly to the vault, not saved locally. " +
 			"For SSH, use --no-browser with a forwarded --callback-address port.",
 		Args: cobra.NoArgs,
@@ -41,11 +43,24 @@ func (o *agentOptions) newVaultCredentialCreateCommandWithOAuth(authorize author
 			}
 			useOAuth := cmd.Flags().Changed("mcp-server-url")
 			if useOAuth {
+				if cmd.Flags().Changed("oauth-client-secret-file") {
+					if oauth.ClientID == "" {
+						return fmt.Errorf("--oauth-client-secret-file requires --oauth-client-id")
+					}
+					secret, err := os.ReadFile(clientSecretFile)
+					if err != nil {
+						return fmt.Errorf("could not read --oauth-client-secret-file")
+					}
+					oauth.ClientSecret = strings.TrimSuffix(strings.TrimSuffix(string(secret), "\n"), "\r")
+					if oauth.ClientSecret == "" {
+						return fmt.Errorf("--oauth-client-secret-file must contain a non-empty secret")
+					}
+				}
 				if err := mcpoauth.ValidateOptions(oauth); err != nil {
 					return err
 				}
 			} else {
-				for _, name := range []string{"oauth-issuer", "oauth-client-id", "oauth-scope", "oauth-timeout", "callback-address", "no-browser", "no-refresh", "allow-http"} {
+				for _, name := range []string{"oauth-issuer", "oauth-client-id", "oauth-client-secret-file", "oauth-scope", "oauth-timeout", "callback-address", "no-browser", "no-refresh", "allow-http"} {
 					if cmd.Flags().Changed(name) {
 						return fmt.Errorf("--%s requires --mcp-server-url", name)
 					}
@@ -100,8 +115,9 @@ func (o *agentOptions) newVaultCredentialCreateCommandWithOAuth(authorize author
 	addVaultCredentialParentFlag(cmd, &opts)
 	addVaultCredentialPayloadFlags(cmd, &opts, false)
 	cmd.Flags().StringVar(&oauth.ServerURL, "mcp-server-url", "", "MCP HTTP endpoint to authorize and register in the vault")
-	cmd.Flags().StringVar(&oauth.Issuer, "oauth-issuer", "", "Authorization server issuer (select when multiple are advertised)")
-	cmd.Flags().StringVar(&oauth.ClientID, "oauth-client-id", "", "Pre-registered public client ID (default: dynamic client registration)")
+	cmd.Flags().StringVar(&oauth.Issuer, "oauth-issuer", "", "Select an advertised authorization server or pin the expected issuer of a single OAuth proxy")
+	cmd.Flags().StringVar(&oauth.ClientID, "oauth-client-id", "", "Pre-registered OAuth client ID (default: dynamic client registration)")
+	cmd.Flags().StringVar(&clientSecretFile, "oauth-client-secret-file", "", "File containing a pre-registered client secret for client_secret_basic")
 	cmd.Flags().StringArrayVar(&oauth.Scopes, "oauth-scope", nil, "OAuth scope override; repeat or separate scopes with spaces")
 	cmd.Flags().DurationVar(&oauth.Timeout, "oauth-timeout", oauth.Timeout, "Timeout for the complete OAuth flow")
 	cmd.Flags().StringVar(&oauth.CallbackAddress, "callback-address", oauth.CallbackAddress, "OAuth callback listener at 127.0.0.1:<port>; 0 selects a free port")

@@ -26,20 +26,24 @@ import (
 // All protocol assertions use HTTP boundaries and the browser seam, not the
 // implementation's discovery, callback, or token helpers.
 type oauthFixture struct {
-	t              *testing.T
-	server         *httptest.Server
-	metadata       map[string]any
-	tokens         map[string]any
-	metadataPath   string
-	issuerPath     string
-	advertisePRM   bool
-	resourceScopes []string
-	tokenStatus    int
-	registration   map[string]any
-	mu             sync.Mutex
-	registered     []map[string]any
-	authorizations []url.Values
-	exchanges      []url.Values
+	t                                    *testing.T
+	server                               *httptest.Server
+	metadata                             map[string]any
+	tokens                               map[string]any
+	metadataPath                         string
+	issuerPath                           string
+	advertisePRM                         bool
+	resourceScopes                       []string
+	tokenStatus                          int
+	registration                         map[string]any
+	mu                                   sync.Mutex
+	registered                           []map[string]any
+	authorizations                       []url.Values
+	exchanges                            []url.Values
+	callbackIssuer                       string
+	authorizationServers                 []string
+	tokenAuthMethod                      string
+	expectedBasicID, expectedBasicSecret string
 }
 
 func newOAuthFixture(t *testing.T) *oauthFixture {
@@ -78,7 +82,11 @@ func (f *oauthFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusUnauthorized)
 	case "/resource-metadata", "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource":
-		json.NewEncoder(w).Encode(map[string]any{"resource": f.server.URL, "authorization_servers": []string{f.server.URL + f.issuerPath}, "scopes_supported": f.resourceScopes})
+		servers := f.authorizationServers
+		if servers == nil {
+			servers = []string{f.server.URL + f.issuerPath}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"resource": f.server.URL, "authorization_servers": servers, "scopes_supported": f.resourceScopes})
 	case f.metadataPath:
 		json.NewEncoder(w).Encode(f.metadata)
 	case "/register":
@@ -104,7 +112,11 @@ func (f *oauthFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad redirect", 400)
 			return
 		}
-		callback.RawQuery = url.Values{"code": {"code-secret"}, "state": {q.Get("state")}, "iss": {f.server.URL + f.issuerPath}}.Encode()
+		issuer := f.callbackIssuer
+		if issuer == "" {
+			issuer = f.server.URL + f.issuerPath
+		}
+		callback.RawQuery = url.Values{"code": {"code-secret"}, "state": {q.Get("state")}, "iss": {issuer}}.Encode()
 		http.Redirect(w, r, callback.String(), http.StatusFound)
 	case "/token":
 		if r.Method != http.MethodPost {
@@ -113,11 +125,19 @@ func (f *oauthFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
 			f.t.Errorf("token content type = %q", r.Header.Get("Content-Type"))
 		}
-		if r.Header.Get("Authorization") != "" {
+		if f.tokenAuthMethod == "client_secret_basic" {
+			id, secret, ok := r.BasicAuth()
+			if !ok || id != url.QueryEscape(f.expectedBasicID) || secret != url.QueryEscape(f.expectedBasicSecret) {
+				f.t.Error("token endpoint did not receive the expected form-encoded Basic credentials")
+			}
+		} else if r.Header.Get("Authorization") != "" {
 			f.t.Error("public client sent Authorization header")
 		}
 		if err := r.ParseForm(); err != nil {
 			f.t.Errorf("parse token form: %v", err)
+		}
+		if f.tokenAuthMethod == "client_secret_basic" && (r.PostForm.Has("client_id") || r.PostForm.Has("client_secret")) {
+			f.t.Error("Basic credentials were duplicated in the token form")
 		}
 		f.mu.Lock()
 		f.exchanges = append(f.exchanges, r.PostForm)
@@ -291,7 +311,7 @@ func TestAuthorizeRejectsInvalidMetadata(t *testing.T) {
 		{"issuer mismatch", "issuer", "https://other.example"},
 		{"missing PKCE", "code_challenge_methods_supported", nil},
 		{"plain PKCE only", "code_challenge_methods_supported", []string{"plain"}},
-		{"confidential only", "token_endpoint_auth_methods_supported", []string{"client_secret_basic"}},
+		{"unsupported authentication", "token_endpoint_auth_methods_supported", []string{"private_key_jwt"}},
 		{"missing token endpoint", "token_endpoint", nil},
 		{"missing registration endpoint", "registration_endpoint", nil},
 		{"unsafe endpoint", "token_endpoint", "http://example.com/token"},
@@ -476,7 +496,7 @@ func TestAuthorizeRefreshOutputUsesReturnedToken(t *testing.T) {
 	}
 }
 
-func TestAuthorizeExplicitIssuerMustMatchResourceMetadata(t *testing.T) {
+func TestAuthorizeExplicitIssuerMustMatchReturnedMetadata(t *testing.T) {
 	f := newOAuthFixture(t)
 	opts := f.options()
 	opts.Issuer = f.server.URL + "/unadvertised"

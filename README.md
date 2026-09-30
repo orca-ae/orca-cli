@@ -278,11 +278,34 @@ exchanges the code, and sends the auth object directly to the registry. Progress
 authorization URL go to stderr; stdout contains only the credential result, not OAuth tokens.
 Tokens are not cached or written to local files. The registry owns subsequent token refresh.
 
-By default, a new public client is dynamically registered on each run. For a pre-registered public
-client, pass `--oauth-client-id <id>` and configure its redirect URI as
+By default, a new client is dynamically registered on each run. The flow prefers public-client
+authentication (`none`) when advertised, and otherwise supports `client_secret_basic`. For Basic
+authentication, the registration response must supply a client secret; the CLI uses it for the
+token exchange and includes it in the vault's refresh settings without printing or caching it.
+
+For a pre-registered client, pass `--oauth-client-id <id>` and configure its redirect URI as
 `http://127.0.0.1:<port>/oauth/callback`, selecting that port with `--callback-address`. The
 provider must accept this exact redirect URI (or explicitly permit dynamic loopback ports).
-Confidential clients and client-credentials grants are not supported by this browser flow.
+A pre-registered Basic client also needs `--oauth-client-secret-file <path>`. The file contains only
+the secret, optionally followed by a line ending, keeping it out of process arguments and help text.
+Client-credentials grants and other token endpoint authentication methods are not supported.
+
+OAuth proxies sometimes publish one discovery location in protected-resource metadata while their
+authorization-server metadata identifies an upstream issuer. The default flow rejects that
+mismatch. If you have independently verified the expected issuer, pin it explicitly:
+
+```bash
+ork agent vaults credentials create \
+  --vault vlt_123 --display-name "Example MCP" \
+  --mcp-server-url https://mcp.example.com/mcp \
+  --oauth-issuer https://identity.example/ \
+  --output json
+```
+
+When exactly one authorization server is advertised, discovery still uses that location and checks
+its metadata and callback against the pinned issuer. All OAuth endpoints must remain on the proxy's
+origin. With multiple advertised servers, `--oauth-issuer` must select one of them; a mismatching
+issuer never silently replaces the selected server.
 
 For a headless or SSH flow, pin and forward the callback port, then open the printed URL in a local
 browser:
@@ -301,7 +324,8 @@ ork agent vaults credentials create \
 
 Additional options:
 
-- `--oauth-issuer <issuer>` selects among multiple advertised authorization servers.
+- `--oauth-issuer <issuer>` selects an advertised authorization server or pins the expected issuer
+  of a single OAuth proxy.
 - `--oauth-scope "tools.read"` overrides requested scopes; repeat as needed.
 - `--oauth-timeout 5m` bounds the complete OAuth flow.
 - `--no-refresh` disables requesting offline access/a refresh grant. Without a returned refresh

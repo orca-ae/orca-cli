@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -92,6 +94,9 @@ func TestVaultCredentialOAuthRejectsFlagsBeforeFlow(t *testing.T) {
 		{"empty MCP URL", []string{"--mcp-server-url", ""}},
 		{"mutually exclusive", []string{"--auth-json", "{}", "--mcp-server-url", "https://example.com/mcp"}},
 		{"OAuth flag without URL", []string{"--auth-json", "{}", "--no-browser"}},
+		{"secret flag without URL", []string{"--auth-json", "{}", "--oauth-client-secret-file", "missing-file"}},
+		{"secret without client ID", []string{"--mcp-server-url", "https://example.com/mcp", "--oauth-client-secret-file", "missing-file"}},
+		{"missing secret file", []string{"--mcp-server-url", "https://example.com/mcp", "--oauth-client-id", "client", "--oauth-client-secret-file", filepath.Join(t.TempDir(), "missing")}},
 		{"HTTP without opt-in", []string{"--mcp-server-url", "http://127.0.0.1/mcp"}},
 		{"non-loopback HTTP", []string{"--mcp-server-url", "http://example.com/mcp", "--allow-http"}},
 		{"invalid callback", []string{"--mcp-server-url", "https://example.com/mcp", "--callback-address", "0.0.0.0:1234"}},
@@ -252,5 +257,70 @@ func TestOAuthCredentialResultRedactsEmbeddedSecrets(t *testing.T) {
 				t.Fatal("redaction mutated caller input")
 			}
 		})
+	}
+}
+
+func TestVaultCredentialOAuthClientSecretFile(t *testing.T) {
+	secretFile := filepath.Join(t.TempDir(), "client-secret")
+	if err := os.WriteFile(secretFile, []byte("private-client-secret\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Error(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"id": "cred_123", "auth": payload["auth"]})
+	}))
+	defer server.Close()
+	original := newWorkspaceManagedAgentsClient
+	t.Cleanup(func() { newWorkspaceManagedAgentsClient = original })
+	newWorkspaceManagedAgentsClient = func() (workspaceManagedAgentsClient, error) {
+		client, err := registry.NewClient(server.URL, "registry-token", server.Client())
+		if err != nil {
+			return nil, err
+		}
+		return registry.NewManagedAgentsClient(client), nil
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := (&agentOptions{ioStreams: IOStreams{Out: &stdout, ErrOut: &stderr}}).newVaultCredentialCreateCommandWithOAuth(
+		func(ctx context.Context, opts mcpoauth.Options, progress io.Writer) (map[string]any, error) {
+			if opts.ClientID != "registered-client" || opts.ClientSecret != "private-client-secret" {
+				t.Error("secret file did not supply the client credentials")
+			}
+			return map[string]any{"type": "mcp_oauth", "access_token": "private-access",
+				"refresh": map[string]any{"refresh_token": "private-refresh", "token_endpoint_auth": map[string]any{"type": "client_secret_basic", "client_secret": opts.ClientSecret}}}, nil
+		})
+	cmd.SetArgs([]string{"--vault", "vlt_123", "--mcp-server-url", "https://mcp.example.com/mcp", "--oauth-client-id", "registered-client", "--oauth-client-secret-file", secretFile, "--output", "json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	refresh := payload["auth"].(map[string]any)["refresh"].(map[string]any)
+	if refresh["token_endpoint_auth"].(map[string]any)["client_secret"] != "private-client-secret" {
+		t.Fatal("client secret did not reach the registry")
+	}
+	for _, secret := range []string{"private-client-secret", "private-access", "private-refresh"} {
+		if strings.Contains(stdout.String()+stderr.String(), secret) {
+			t.Fatal("OAuth command output exposed credentials")
+		}
+	}
+}
+
+func TestVaultCredentialOAuthRejectsEmptySecretFile(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "client-secret")
+	if err := os.WriteFile(file, []byte("\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := (&agentOptions{ioStreams: IOStreams{Out: io.Discard, ErrOut: io.Discard}}).newVaultCredentialCreateCommandWithOAuth(
+		func(context.Context, mcpoauth.Options, io.Writer) (map[string]any, error) {
+			t.Error("OAuth started with an empty secret file")
+			return nil, nil
+		})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--vault", "vlt_123", "--mcp-server-url", "https://mcp.example.com/mcp", "--oauth-client-id", "client", "--oauth-client-secret-file", file})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "non-empty secret") {
+		t.Fatalf("unexpected validation result: %v", err)
 	}
 }

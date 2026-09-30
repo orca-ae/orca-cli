@@ -27,15 +27,18 @@ import (
 	"time"
 )
 
-// Options configures a public-client authorization-code flow. Zero Timeout uses
+// Options configures an authorization-code flow with public or Basic client authentication. Zero Timeout uses
 // five minutes; empty CallbackAddress uses an ephemeral 127.0.0.1 port.
-// ClientID skips dynamic registration. NoRefresh only suppresses refresh requests;
+// ClientID skips dynamic registration; ClientSecret enables Basic authentication
+// for a pre-registered client. Issuer pins the expected identity while a sole
+// advertised OAuth proxy remains the metadata discovery location.
+// NoRefresh only suppresses refresh requests;
 // a refresh token returned by the server is still included in the result.
 type Options struct {
-	ServerURL, Issuer, ClientID, CallbackAddress string
-	Scopes                                       []string
-	Timeout                                      time.Duration
-	NoBrowser, NoRefresh, AllowHTTP              bool
+	ServerURL, Issuer, ClientID, ClientSecret, CallbackAddress string
+	Scopes                                                     []string
+	Timeout                                                    time.Duration
+	NoBrowser, NoRefresh, AllowHTTP                            bool
 }
 
 func defaults(o Options) Options {
@@ -59,6 +62,9 @@ func ValidateOptions(o Options) error {
 		if err := checkIssuer(o.Issuer, o.AllowHTTP); err != nil {
 			return err
 		}
+	}
+	if o.ClientSecret != "" && o.ClientID == "" {
+		return errors.New("OAuth client secret requires a pre-registered client ID")
 	}
 	if o.Timeout < 0 {
 		return errors.New("OAuth timeout must be positive")
@@ -137,6 +143,7 @@ type flow struct {
 }
 type config struct {
 	resource, issuer, authorization, token, registration string
+	tokenAuthMethod                                      string
 	scopes                                               []string
 	requireIssuer                                        bool
 }
@@ -227,10 +234,10 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 	served := make(chan struct{})
 	go func() { defer close(served); _ = srv.Serve(ln) }()
 	defer func() { _ = srv.Close(); _ = ln.Close(); <-served }()
-	clientID := opts.ClientID
-	if clientID == "" {
-		fmt.Fprintln(progress, "Registering public OAuth client")
-		clientID, err = f.register(ctx, cfg, redirect)
+	client := oauthClient{id: opts.ClientID, secret: opts.ClientSecret, method: cfg.tokenAuthMethod}
+	if client.id == "" {
+		fmt.Fprintln(progress, "Registering OAuth client")
+		client, err = f.register(ctx, cfg, redirect)
 		if err != nil {
 			return nil, err
 		}
@@ -238,7 +245,7 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 	digest := sha256.Sum256([]byte(verifier))
 	u, _ := url.Parse(cfg.authorization)
 	q := u.Query()
-	for k, v := range map[string]string{"response_type": "code", "client_id": clientID, "redirect_uri": redirect, "state": state, "code_challenge": base64.RawURLEncoding.EncodeToString(digest[:]), "code_challenge_method": "S256", "resource": cfg.resource} {
+	for k, v := range map[string]string{"response_type": "code", "client_id": client.id, "redirect_uri": redirect, "state": state, "code_challenge": base64.RawURLEncoding.EncodeToString(digest[:]), "code_challenge_method": "S256", "resource": cfg.resource} {
 		q.Set(k, v)
 	}
 	q.Del("scope")
@@ -281,8 +288,8 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 		return nil, errors.New("OAuth callback is missing authorization code")
 	}
 	fmt.Fprintln(progress, "Exchanging authorization code for tokens")
-	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirect}, "client_id": {clientID}, "code_verifier": {verifier}, "resource": {cfg.resource}}
-	tokens, err := f.post(ctx, cfg.token, "application/x-www-form-urlencoded", form.Encode(), "token exchange")
+	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirect}, "code_verifier": {verifier}, "resource": {cfg.resource}}
+	tokens, err := f.exchange(ctx, cfg.token, form, client)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +319,7 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 		refreshScope = granted
 	}
 	if refresh, ok := tokens["refresh_token"].(string); ok && refresh != "" {
-		settings := map[string]any{"refresh_token": refresh, "token_endpoint": cfg.token, "client_id": clientID, "token_endpoint_auth": map[string]any{"type": "none"}, "resource": cfg.resource}
+		settings := map[string]any{"refresh_token": refresh, "token_endpoint": cfg.token, "client_id": client.id, "token_endpoint_auth": client.refreshAuth(), "resource": cfg.resource}
 		if refreshScope != "" {
 			settings["scope"] = refreshScope
 		}
@@ -367,6 +374,10 @@ func randomString() (string, error) {
 const maxResponseBytes = 1024 * 1024
 
 func (f *flow) request(ctx context.Context, target, method, contentType, body string, headersOnly bool) (int, http.Header, []byte, error) {
+	return f.requestAuthenticated(ctx, target, method, contentType, body, headersOnly, "")
+}
+
+func (f *flow) requestAuthenticated(ctx context.Context, target, method, contentType, body string, headersOnly bool, authorization string) (int, http.Header, []byte, error) {
 	if _, e := checkedURL(target, f.opts.AllowHTTP); e != nil {
 		return 0, nil, nil, e
 	}
@@ -375,6 +386,9 @@ func (f *flow) request(ctx context.Context, target, method, contentType, body st
 		return 0, nil, nil, errors.New("invalid OAuth request")
 	}
 	req.Header.Set("Accept", "application/json")
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -427,27 +441,79 @@ func (f *flow) post(ctx context.Context, target, typ, body, stage string) (map[s
 	}
 	return object(data)
 }
-func (f *flow) register(ctx context.Context, c config, redirect string) (string, error) {
+
+// oauthClient keeps token endpoint credentials out of URLs and progress output.
+type oauthClient struct {
+	id, secret, method string
+}
+
+func (c oauthClient) refreshAuth() map[string]any {
+	auth := map[string]any{"type": c.method}
+	if c.method == "client_secret_basic" {
+		auth["client_secret"] = c.secret
+	}
+	return auth
+}
+
+func (f *flow) exchange(ctx context.Context, target string, form url.Values, client oauthClient) (map[string]any, error) {
+	authorization := ""
+	if client.method == "client_secret_basic" {
+		// RFC 6749 section 2.3.1 encodes each value before constructing Basic.
+		pair := url.QueryEscape(client.id) + ":" + url.QueryEscape(client.secret)
+		authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(pair))
+	} else {
+		form.Set("client_id", client.id)
+	}
+	status, _, data, err := f.requestAuthenticated(ctx, target, "POST", "application/x-www-form-urlencoded", form.Encode(), false, authorization)
+	if err != nil {
+		return nil, fmt.Errorf("token exchange: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("token exchange failed with HTTP %d", status)
+	}
+	return object(data)
+}
+
+func (f *flow) register(ctx context.Context, c config, redirect string) (oauthClient, error) {
+	var client oauthClient
 	grants := []string{"authorization_code"}
 	if !f.opts.NoRefresh {
 		grants = append(grants, "refresh_token")
 	}
-	payload := map[string]any{"client_name": "orca-cli", "application_type": "native", "redirect_uris": []string{redirect}, "grant_types": grants, "response_types": []string{"code"}, "token_endpoint_auth_method": "none"}
+	payload := map[string]any{"client_name": "orca-cli", "redirect_uris": []string{redirect}, "grant_types": grants, "response_types": []string{"code"}, "token_endpoint_auth_method": c.tokenAuthMethod}
+	if c.tokenAuthMethod == "none" {
+		payload["application_type"] = "native"
+	}
 	if len(c.scopes) > 0 {
 		payload["scope"] = strings.Join(c.scopes, " ")
 	}
 	b, _ := json.Marshal(payload)
-	m, e := f.post(ctx, c.registration, "application/json", string(b), "dynamic client registration")
-	if e != nil {
-		return "", e
+	m, err := f.post(ctx, c.registration, "application/json", string(b), "dynamic client registration")
+	if err != nil {
+		return client, err
 	}
 	id, ok := m["client_id"].(string)
 	if !ok || id == "" {
-		return "", errors.New("dynamic client registration response is missing client_id")
+		return client, errors.New("dynamic client registration response is missing client_id")
 	}
 	// RFC 7591 defaults an omitted method to client_secret_basic, not none.
-	if method, ok := m["token_endpoint_auth_method"].(string); !ok || method != "none" {
-		return "", errors.New("dynamic client registration did not create a public client")
+	method := "client_secret_basic"
+	if value, exists := m["token_endpoint_auth_method"]; exists {
+		var ok bool
+		method, ok = value.(string)
+		if !ok {
+			return client, errors.New("invalid dynamic client registration authentication method")
+		}
 	}
-	return id, nil
+	if method != c.tokenAuthMethod {
+		return client, errors.New("dynamic client registration returned an unexpected authentication method")
+	}
+	client = oauthClient{id: id, method: method}
+	if method == "client_secret_basic" {
+		client.secret, ok = m["client_secret"].(string)
+		if !ok || client.secret == "" {
+			return oauthClient{}, errors.New("dynamic client registration response is missing client_secret")
+		}
+	}
+	return client, nil
 }
