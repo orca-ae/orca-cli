@@ -27,15 +27,19 @@ import (
 	"time"
 )
 
-// Options configures a public-client authorization-code flow. Zero Timeout uses
+// Options configures an authorization-code + PKCE flow. Zero Timeout uses
 // five minutes; empty CallbackAddress uses an ephemeral 127.0.0.1 port.
-// ClientID skips dynamic registration. NoRefresh only suppresses refresh requests;
+// ClientID skips dynamic registration for a pre-registered public client.
+// NoRefresh only suppresses refresh requests;
 // a refresh token returned by the server is still included in the result.
 type Options struct {
 	ServerURL, Issuer, ClientID, CallbackAddress string
 	Scopes                                       []string
 	Timeout                                      time.Duration
 	NoBrowser, NoRefresh, AllowHTTP              bool
+	// AllowIssuerMismatch disables discovery issuer identity matching, not URL
+	// validation or exact callback issuer checks against the accepted metadata.
+	AllowIssuerMismatch bool
 }
 
 func defaults(o Options) Options {
@@ -137,6 +141,7 @@ type flow struct {
 }
 type config struct {
 	resource, issuer, authorization, token, registration string
+	authMethod                                           string
 	scopes                                               []string
 	requireIssuer                                        bool
 }
@@ -150,6 +155,9 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 	defer cancel()
 	if progress == nil {
 		progress = io.Discard
+	}
+	if opts.AllowIssuerMismatch {
+		fmt.Fprintln(progress, "Warning: --oauth-allow-issuer-mismatch disables discovery issuer identity matching; only use it with a trusted authorization server.")
 	}
 	// Own the transport: process-global DefaultTransport overrides must not
 	// disable TLS verification, introduce redirects, or panic via type assertion.
@@ -227,10 +235,10 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 	served := make(chan struct{})
 	go func() { defer close(served); _ = srv.Serve(ln) }()
 	defer func() { _ = srv.Close(); _ = ln.Close(); <-served }()
-	clientID := opts.ClientID
-	if clientID == "" {
-		fmt.Fprintln(progress, "Registering public OAuth client")
-		clientID, err = f.register(ctx, cfg, redirect)
+	client := oauthClient{id: opts.ClientID, authMethod: "none"}
+	if client.id == "" {
+		fmt.Fprintln(progress, "Registering OAuth client")
+		client, err = f.register(ctx, cfg, redirect)
 		if err != nil {
 			return nil, err
 		}
@@ -238,7 +246,7 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 	digest := sha256.Sum256([]byte(verifier))
 	u, _ := url.Parse(cfg.authorization)
 	q := u.Query()
-	for k, v := range map[string]string{"response_type": "code", "client_id": clientID, "redirect_uri": redirect, "state": state, "code_challenge": base64.RawURLEncoding.EncodeToString(digest[:]), "code_challenge_method": "S256", "resource": cfg.resource} {
+	for k, v := range map[string]string{"response_type": "code", "client_id": client.id, "redirect_uri": redirect, "state": state, "code_challenge": base64.RawURLEncoding.EncodeToString(digest[:]), "code_challenge_method": "S256", "resource": cfg.resource} {
 		q.Set(k, v)
 	}
 	q.Del("scope")
@@ -281,8 +289,17 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 		return nil, errors.New("OAuth callback is missing authorization code")
 	}
 	fmt.Fprintln(progress, "Exchanging authorization code for tokens")
-	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirect}, "client_id": {clientID}, "code_verifier": {verifier}, "resource": {cfg.resource}}
-	tokens, err := f.post(ctx, cfg.token, "application/x-www-form-urlencoded", form.Encode(), "token exchange")
+	form := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirect}, "client_id": {client.id}, "code_verifier": {verifier}, "resource": {cfg.resource}}
+	var authorization string
+	switch client.authMethod {
+	case "client_secret_post":
+		form.Set("client_secret", client.secret)
+	case "client_secret_basic":
+		// RFC 6749 section 2.3.1 encodes each credential before HTTP Basic.
+		credentials := url.QueryEscape(client.id) + ":" + url.QueryEscape(client.secret)
+		authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(credentials))
+	}
+	tokens, err := f.post(ctx, cfg.token, "application/x-www-form-urlencoded", form.Encode(), "token exchange", authorization)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +329,11 @@ func authorize(ctx context.Context, opts Options, progress io.Writer, openBrowse
 		refreshScope = granted
 	}
 	if refresh, ok := tokens["refresh_token"].(string); ok && refresh != "" {
-		settings := map[string]any{"refresh_token": refresh, "token_endpoint": cfg.token, "client_id": clientID, "token_endpoint_auth": map[string]any{"type": "none"}, "resource": cfg.resource}
+		method := map[string]any{"type": client.authMethod}
+		if client.authMethod != "none" {
+			method["client_secret"] = client.secret
+		}
+		settings := map[string]any{"refresh_token": refresh, "token_endpoint": cfg.token, "client_id": client.id, "token_endpoint_auth": method, "resource": cfg.resource}
 		if refreshScope != "" {
 			settings["scope"] = refreshScope
 		}
@@ -366,7 +387,7 @@ func randomString() (string, error) {
 
 const maxResponseBytes = 1024 * 1024
 
-func (f *flow) request(ctx context.Context, target, method, contentType, body string, headersOnly bool) (int, http.Header, []byte, error) {
+func (f *flow) request(ctx context.Context, target, method, contentType, body string, headersOnly bool, authorization string) (int, http.Header, []byte, error) {
 	if _, e := checkedURL(target, f.opts.AllowHTTP); e != nil {
 		return 0, nil, nil, e
 	}
@@ -377,6 +398,9 @@ func (f *flow) request(ctx context.Context, target, method, contentType, body st
 	req.Header.Set("Accept", "application/json")
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
+	}
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
 	}
 	if headersOnly {
 		req.Header.Set("Accept", "application/json, text/event-stream")
@@ -417,8 +441,8 @@ func object(data []byte) (map[string]any, error) {
 	}
 	return m, nil
 }
-func (f *flow) post(ctx context.Context, target, typ, body, stage string) (map[string]any, error) {
-	status, _, data, e := f.request(ctx, target, "POST", typ, body, false)
+func (f *flow) post(ctx context.Context, target, typ, body, stage, authorization string) (map[string]any, error) {
+	status, _, data, e := f.request(ctx, target, "POST", typ, body, false, authorization)
 	if e != nil {
 		return nil, fmt.Errorf("%s: %w", stage, e)
 	}
@@ -427,27 +451,44 @@ func (f *flow) post(ctx context.Context, target, typ, body, stage string) (map[s
 	}
 	return object(data)
 }
-func (f *flow) register(ctx context.Context, c config, redirect string) (string, error) {
+
+type oauthClient struct {
+	id, secret, authMethod string
+}
+
+func (f *flow) register(ctx context.Context, c config, redirect string) (oauthClient, error) {
+	var client oauthClient
 	grants := []string{"authorization_code"}
 	if !f.opts.NoRefresh {
 		grants = append(grants, "refresh_token")
 	}
-	payload := map[string]any{"client_name": "orca-cli", "application_type": "native", "redirect_uris": []string{redirect}, "grant_types": grants, "response_types": []string{"code"}, "token_endpoint_auth_method": "none"}
+	payload := map[string]any{"client_name": "orca-cli", "application_type": "native", "redirect_uris": []string{redirect}, "grant_types": grants, "response_types": []string{"code"}, "token_endpoint_auth_method": c.authMethod}
 	if len(c.scopes) > 0 {
 		payload["scope"] = strings.Join(c.scopes, " ")
 	}
 	b, _ := json.Marshal(payload)
-	m, e := f.post(ctx, c.registration, "application/json", string(b), "dynamic client registration")
+	m, e := f.post(ctx, c.registration, "application/json", string(b), "dynamic client registration", "")
 	if e != nil {
-		return "", e
+		return client, e
 	}
 	id, ok := m["client_id"].(string)
 	if !ok || id == "" {
-		return "", errors.New("dynamic client registration response is missing client_id")
+		return client, errors.New("dynamic client registration response is missing client_id")
 	}
 	// RFC 7591 defaults an omitted method to client_secret_basic, not none.
-	if method, ok := m["token_endpoint_auth_method"].(string); !ok || method != "none" {
-		return "", errors.New("dynamic client registration did not create a public client")
+	method := "client_secret_basic"
+	if v, exists := m["token_endpoint_auth_method"]; exists {
+		method, _ = v.(string)
 	}
-	return id, nil
+	if method != "none" && method != "client_secret_post" && method != "client_secret_basic" {
+		return client, errors.New("dynamic client registration returned an unsupported token endpoint authentication method")
+	}
+	var secret string
+	if method != "none" {
+		secret, ok = m["client_secret"].(string)
+		if !ok || secret == "" {
+			return client, errors.New("dynamic client registration response is missing client_secret")
+		}
+	}
+	return oauthClient{id: id, secret: secret, authMethod: method}, nil
 }

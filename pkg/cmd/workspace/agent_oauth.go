@@ -31,7 +31,9 @@ func (o *agentOptions) newVaultCredentialCreateCommandWithOAuth(authorize author
 		Use:   "create --vault <vault-id> (--auth-json <json> | --mcp-server-url <url>)",
 		Short: "Create a vault credential, optionally completing MCP OAuth in the browser",
 		Long: "Create a vault credential from auth JSON, or authorize an MCP server using OAuth " +
-			"discovery, a public client, PKCE, and a loopback browser callback. " +
+			"discovery, dynamic client registration, PKCE, and a loopback browser callback. " +
+			"Discovery accepts HTTPS issuer aliases within the same registrable domain and port; " +
+			"the actual metadata issuer is pinned for callback validation. " +
 			"OAuth tokens are sent directly to the vault, not saved locally. " +
 			"For SSH, use --no-browser with a forwarded --callback-address port.",
 		Args: cobra.NoArgs,
@@ -45,7 +47,7 @@ func (o *agentOptions) newVaultCredentialCreateCommandWithOAuth(authorize author
 					return err
 				}
 			} else {
-				for _, name := range []string{"oauth-issuer", "oauth-client-id", "oauth-scope", "oauth-timeout", "callback-address", "no-browser", "no-refresh", "allow-http"} {
+				for _, name := range []string{"oauth-issuer", "oauth-allow-issuer-mismatch", "oauth-client-id", "oauth-scope", "oauth-timeout", "callback-address", "no-browser", "no-refresh", "allow-http"} {
 					if cmd.Flags().Changed(name) {
 						return fmt.Errorf("--%s requires --mcp-server-url", name)
 					}
@@ -101,6 +103,7 @@ func (o *agentOptions) newVaultCredentialCreateCommandWithOAuth(authorize author
 	addVaultCredentialPayloadFlags(cmd, &opts, false)
 	cmd.Flags().StringVar(&oauth.ServerURL, "mcp-server-url", "", "MCP HTTP endpoint to authorize and register in the vault")
 	cmd.Flags().StringVar(&oauth.Issuer, "oauth-issuer", "", "Authorization server issuer (select when multiple are advertised)")
+	cmd.Flags().BoolVar(&oauth.AllowIssuerMismatch, "oauth-allow-issuer-mismatch", false, "Allow discovery issuer mismatches across registrable domains (trusted servers only; callback issuer checks remain enabled)")
 	cmd.Flags().StringVar(&oauth.ClientID, "oauth-client-id", "", "Pre-registered public client ID (default: dynamic client registration)")
 	cmd.Flags().StringArrayVar(&oauth.Scopes, "oauth-scope", nil, "OAuth scope override; repeat or separate scopes with spaces")
 	cmd.Flags().DurationVar(&oauth.Timeout, "oauth-timeout", oauth.Timeout, "Timeout for the complete OAuth flow")

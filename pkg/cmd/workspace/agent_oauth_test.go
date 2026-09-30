@@ -56,14 +56,14 @@ func TestVaultCredentialOAuthRegistersWithRegistry(t *testing.T) {
 			if gotCtx != ctx {
 				t.Error("OAuth did not inherit command context")
 			}
-			want := mcpoauth.Options{ServerURL: "https://mcp.example.com/mcp", Issuer: "https://issuer.example.com", ClientID: "client", Scopes: []string{"read write", "offline_access"}, Timeout: time.Minute, CallbackAddress: "127.0.0.1:53900", NoBrowser: true, NoRefresh: true}
+			want := mcpoauth.Options{ServerURL: "https://mcp.example.com/mcp", Issuer: "https://issuer.example.com", ClientID: "client", Scopes: []string{"read write", "offline_access"}, Timeout: time.Minute, CallbackAddress: "127.0.0.1:53900", NoBrowser: true, NoRefresh: true, AllowIssuerMismatch: true}
 			if !reflect.DeepEqual(opts, want) {
 				t.Errorf("OAuth options = %#v, want %#v", opts, want)
 			}
 			fmt.Fprintln(progress, "Authorize in browser")
 			return auth, nil
 		})
-	cmd.SetArgs([]string{"--vault", "vault 1/child", "--display-name", "Example MCP", "--mcp-server-url", "https://mcp.example.com/mcp", "--oauth-issuer", "https://issuer.example.com", "--oauth-client-id", "client", "--oauth-scope", "read write", "--oauth-scope", "offline_access", "--oauth-timeout", "1m", "--callback-address", "127.0.0.1:53900", "--no-browser", "--no-refresh", "--metadata", "team=platform", "--output", "json"})
+	cmd.SetArgs([]string{"--vault", "vault 1/child", "--display-name", "Example MCP", "--mcp-server-url", "https://mcp.example.com/mcp", "--oauth-issuer", "https://issuer.example.com", "--oauth-allow-issuer-mismatch", "--oauth-client-id", "client", "--oauth-scope", "read write", "--oauth-scope", "offline_access", "--oauth-timeout", "1m", "--callback-address", "127.0.0.1:53900", "--no-browser", "--no-refresh", "--metadata", "team=platform", "--output", "json"})
 	if err := cmd.ExecuteContext(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -92,6 +92,7 @@ func TestVaultCredentialOAuthRejectsFlagsBeforeFlow(t *testing.T) {
 		{"empty MCP URL", []string{"--mcp-server-url", ""}},
 		{"mutually exclusive", []string{"--auth-json", "{}", "--mcp-server-url", "https://example.com/mcp"}},
 		{"OAuth flag without URL", []string{"--auth-json", "{}", "--no-browser"}},
+		{"issuer override without URL", []string{"--auth-json", "{}", "--oauth-allow-issuer-mismatch"}},
 		{"HTTP without opt-in", []string{"--mcp-server-url", "http://127.0.0.1/mcp"}},
 		{"non-loopback HTTP", []string{"--mcp-server-url", "http://example.com/mcp", "--allow-http"}},
 		{"invalid callback", []string{"--mcp-server-url", "https://example.com/mcp", "--callback-address", "0.0.0.0:1234"}},

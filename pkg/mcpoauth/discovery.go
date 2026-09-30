@@ -177,7 +177,7 @@ func resourceIdentity(server, resource string) error {
 // redirects, malformed documents and issuer mismatches are never downgraded.
 func (f *flow) metadata(ctx context.Context, candidates []string) (map[string]any, error) {
 	for _, candidate := range unique(candidates) {
-		status, _, b, e := f.request(ctx, candidate, "GET", "", "", false)
+		status, _, b, e := f.request(ctx, candidate, "GET", "", "", false, "")
 		if e != nil {
 			return nil, e
 		}
@@ -195,7 +195,7 @@ func (f *flow) metadata(ctx context.Context, candidates []string) (map[string]an
 func (f *flow) discover(ctx context.Context) (config, error) {
 	var c config
 	const probe = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"orca-cli-oauth","version":"1"}}}`
-	_, h, _, e := f.request(ctx, f.opts.ServerURL, "POST", "application/json", probe, true)
+	_, h, _, e := f.request(ctx, f.opts.ServerURL, "POST", "application/json", probe, true, "")
 	if e != nil {
 		return c, e
 	}
@@ -269,9 +269,19 @@ func (f *flow) discover(ctx context.Context) (config, error) {
 	if m == nil {
 		return c, errors.New("could not discover authorization-server metadata")
 	}
-	if actual, ok := m["issuer"].(string); !ok || actual != c.issuer {
+	actual, ok := m["issuer"].(string)
+	if !ok || actual == "" {
+		return c, errors.New("authorization-server metadata is missing issuer")
+	}
+	if e = checkIssuer(actual, f.opts.AllowHTTP); e != nil {
+		return c, e
+	}
+	if !f.opts.AllowIssuerMismatch && !compatibleIssuer(c.issuer, actual) {
 		return c, errors.New("authorization-server metadata issuer mismatch")
 	}
+	// Pin the accepted metadata issuer for exact callback validation. Do not
+	// rediscover it or change the endpoints selected by this metadata document.
+	c.issuer = actual
 	methods, e := stringList(m, "code_challenge_methods_supported")
 	if e != nil {
 		return c, e
@@ -283,10 +293,22 @@ func (f *flow) discover(ctx context.Context) (config, error) {
 	if e != nil {
 		return c, e
 	}
-	// RFC 8414 defaults omitted methods to client_secret_basic. This flow
-	// cannot use confidential clients, so require explicit public support.
-	if !contains(methods, "none") {
-		return c, errors.New("authorization server does not support public OAuth clients")
+	// RFC 8414 defaults omitted methods to Basic. Prefer public PKCE clients,
+	// but DCR can provision a per-registration secret when one is required.
+	if _, exists := m["token_endpoint_auth_methods_supported"]; !exists {
+		methods = []string{"client_secret_basic"}
+	}
+	if f.opts.ClientID != "" && !contains(methods, "none") {
+		return c, errors.New("authorization server does not support pre-registered public OAuth clients")
+	}
+	for _, method := range []string{"none", "client_secret_post", "client_secret_basic"} {
+		if contains(methods, method) {
+			c.authMethod = method
+			break
+		}
+	}
+	if c.authMethod == "" {
+		return c, errors.New("authorization server has no supported token endpoint authentication method")
 	}
 	endpoints := []struct {
 		key string

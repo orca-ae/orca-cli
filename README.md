@@ -278,11 +278,27 @@ exchanges the code, and sends the auth object directly to the registry. Progress
 authorization URL go to stderr; stdout contains only the credential result, not OAuth tokens.
 Tokens are not cached or written to local files. The registry owns subsequent token refresh.
 
-By default, a new public client is dynamically registered on each run. For a pre-registered public
-client, pass `--oauth-client-id <id>` and configure its redirect URI as
+By default, a new native client is dynamically registered on each run. The CLI prefers public
+client authentication (`none`), then `client_secret_post`, then `client_secret_basic`, according
+to the server metadata. An omitted methods list defaults to Basic. The actual registration
+response determines how the code is exchanged and how the registry refreshes tokens; a returned
+`none` method never sends or stores an incidental client secret. Secrets required for refresh
+are sent directly to the vault, never printed or saved locally.
+
+For a pre-registered public client, pass `--oauth-client-id <id>` and configure its redirect URI as
 `http://127.0.0.1:<port>/oauth/callback`, selecting that port with `--callback-address`. The
 provider must accept this exact redirect URI (or explicitly permit dynamic loopback ports).
-Confidential clients and client-credentials grants are not supported by this browser flow.
+Pre-registered clients requiring a secret and client-credentials grants are not supported by this
+browser flow.
+
+For gateway interoperability, discovery accepts either an exact issuer match or HTTPS issuers
+with the same registrable domain (Public Suffix List, including private suffixes) and effective
+port. For example, `https://mcp.example.com/tenant` can delegate to `https://auth.example.com/`.
+Different `github.io` tenants are not considered the same registrable domain. IP addresses,
+localhost and unknown suffixes require an exact issuer match by default. This deliberately
+relaxes RFC 8414 section 3.3: a shared registrable domain is not proof of common administration.
+After discovery, the returned metadata issuer is pinned; any callback `iss` must match it
+exactly, and it is required when the server advertises authorization-response issuer support.
 
 For a headless or SSH flow, pin and forward the callback port, then open the printed URL in a local
 browser:
@@ -302,6 +318,11 @@ ork agent vaults credentials create \
 Additional options:
 
 - `--oauth-issuer <issuer>` selects among multiple advertised authorization servers.
+- `--oauth-allow-issuer-mismatch` disables discovery issuer identity matching, including across
+  registrable domains or ports. Use only with a trusted server; it emits a warning on stderr.
+  Metadata must still contain a valid issuer URL. HTTPS, PKCE, state, resource validation and
+  exact callback issuer checks remain enabled. This does not change `--oauth-issuer` selection
+  or disable TLS certificate verification.
 - `--oauth-scope "tools.read"` overrides requested scopes; repeat as needed.
 - `--oauth-timeout 5m` bounds the complete OAuth flow.
 - `--no-refresh` disables requesting offline access/a refresh grant. Without a returned refresh
