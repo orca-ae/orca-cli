@@ -26,20 +26,21 @@ import (
 // All protocol assertions use HTTP boundaries and the browser seam, not the
 // implementation's discovery, callback, or token helpers.
 type oauthFixture struct {
-	t              *testing.T
-	server         *httptest.Server
-	metadata       map[string]any
-	tokens         map[string]any
-	metadataPath   string
-	issuerPath     string
-	advertisePRM   bool
-	resourceScopes []string
-	tokenStatus    int
-	registration   map[string]any
-	mu             sync.Mutex
-	registered     []map[string]any
-	authorizations []url.Values
-	exchanges      []url.Values
+	t               *testing.T
+	server          *httptest.Server
+	metadata        map[string]any
+	tokens          map[string]any
+	metadataPath    string
+	issuerPath      string
+	advertisePRM    bool
+	resourceScopes  []string
+	tokenStatus     int
+	registration    map[string]any
+	mu              sync.Mutex
+	registered      []map[string]any
+	authorizations  []url.Values
+	exchanges       []url.Values
+	exchangeHeaders []http.Header
 }
 
 func newOAuthFixture(t *testing.T) *oauthFixture {
@@ -113,14 +114,12 @@ func (f *oauthFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
 			f.t.Errorf("token content type = %q", r.Header.Get("Content-Type"))
 		}
-		if r.Header.Get("Authorization") != "" {
-			f.t.Error("public client sent Authorization header")
-		}
 		if err := r.ParseForm(); err != nil {
 			f.t.Errorf("parse token form: %v", err)
 		}
 		f.mu.Lock()
 		f.exchanges = append(f.exchanges, r.PostForm)
+		f.exchangeHeaders = append(f.exchangeHeaders, r.Header.Clone())
 		f.mu.Unlock()
 		if f.tokenStatus != 0 {
 			w.WriteHeader(f.tokenStatus)
@@ -237,8 +236,8 @@ func TestAuthorizeEndToEnd(t *testing.T) {
 			if q.Get("code_challenge") != base64.RawURLEncoding.EncodeToString(sum[:]) {
 				t.Error("PKCE challenge does not match verifier")
 			}
-			if form.Has("client_secret") {
-				t.Error("public client sent client_secret")
+			if form.Has("client_secret") || f.exchangeHeaders[0].Get("Authorization") != "" {
+				t.Error("public client sent client authentication")
 			}
 			for _, secret := range []string{"access-secret", "refresh-secret", "code-secret", verifier} {
 				if secret != "" && strings.Contains(progress.String(), secret) {
@@ -291,7 +290,7 @@ func TestAuthorizeRejectsInvalidMetadata(t *testing.T) {
 		{"issuer mismatch", "issuer", "https://other.example"},
 		{"missing PKCE", "code_challenge_methods_supported", nil},
 		{"plain PKCE only", "code_challenge_methods_supported", []string{"plain"}},
-		{"confidential only", "token_endpoint_auth_methods_supported", []string{"client_secret_basic"}},
+		{"unsupported authentication", "token_endpoint_auth_methods_supported", []string{"private_key_jwt"}},
 		{"missing token endpoint", "token_endpoint", nil},
 		{"missing registration endpoint", "registration_endpoint", nil},
 		{"unsafe endpoint", "token_endpoint", "http://example.com/token"},
@@ -437,7 +436,7 @@ func TestAuthorizeRejectsInvalidRegistrationAndTokens(t *testing.T) {
 			})
 		}
 	}
-	t.Run("confidential registration", func(t *testing.T) {
+	t.Run("secret authentication without secret", func(t *testing.T) {
 		f := newOAuthFixture(t)
 		f.registration["token_endpoint_auth_method"] = "client_secret_basic"
 		if auth, err := authorize(context.Background(), f.options(), io.Discard, testBrowser); err == nil || auth != nil {

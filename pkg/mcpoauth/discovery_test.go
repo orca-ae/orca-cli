@@ -90,7 +90,7 @@ func TestProtocolTransport(t *testing.T) {
 			server := httptest.NewServer(tt.handler)
 			defer server.Close()
 			f := flow{opts: Options{AllowHTTP: true}, client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
-			_, err := f.post(context.Background(), server.URL, "application/json", "{}", "test")
+			_, err := f.post(context.Background(), server.URL, "application/json", "{}", "test", "")
 			if err == nil || !strings.Contains(err.Error(), tt.want) || strings.Contains(err.Error(), "secret-") {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -146,8 +146,10 @@ func TestProbeDoesNotWaitForSSEBody(t *testing.T) {
 func TestHTTPSCertificateVerification(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("untrusted TLS should not reach handler") }))
 	defer server.Close()
-	_, err := Authorize(context.Background(), Options{ServerURL: server.URL, NoBrowser: true}, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "request failed") {
-		t.Fatalf("got %v", err)
+	for _, allow := range []bool{false, true} {
+		_, err := Authorize(context.Background(), Options{ServerURL: server.URL, NoBrowser: true, AllowIssuerMismatch: allow}, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "request failed") {
+			t.Fatalf("issuer override=%v: got %v", allow, err)
+		}
 	}
 }
