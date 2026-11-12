@@ -5,11 +5,11 @@ fullnameOverride: orca-managed-agents
 
 images:
   registry:
-    pullPolicy: IfNotPresent
+    pullPolicy: Never
   harness:
-    pullPolicy: IfNotPresent
+    pullPolicy: Never
   aiGateway:
-    pullPolicy: IfNotPresent
+    pullPolicy: Never
 
 secrets:
   create: true
