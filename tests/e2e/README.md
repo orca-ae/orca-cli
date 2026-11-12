@@ -55,24 +55,16 @@ The direct Managed Agents workflow runs only on trusted `main` pushes, the night
 and manual dispatches selecting `main`. It checks out the triggering commit SHA on an ephemeral
 GitHub-hosted runner and does not restore PR-populated Go caches. The ordinary `CI` workflow
 continues running unit and exhaustive mock-backed CLI command E2E tests on every PR without
-secrets. Full-stack integration is intentionally post-merge; a label or same-repository PR author
-is not approval of an immutable code revision.
+secrets. Full-stack integration runs after merge.
 
 Real-service tests isolate each lifecycle scenario. A failed scenario stops at its first failed
 command, records the scenario name, and allows every remaining scenario to run. After all tests
 finish, the suite prints the combined failure count and exits unsuccessfully when that count is
 non-zero.
 
-The workflow still requires `SNBOT_GITHUB_TOKEN` to fetch matching Chart source and pull the
-Chart-pinned GHCR image. Authentication uses an isolated temporary Docker configuration, removed
-on success and failure; no PAT is stored in Kubernetes or uploaded in artifacts. Docker Hub
-images are pulled anonymously and remain subject to its rate limits. Replace the shared token
-with a narrowly scoped, short-lived source/package-read credential when available.
-
-This workflow boundary does not prevent a repository writer from adding another workflow that
-references a repository/organization secret. Administrators must restrict secret availability
-with protected environments or an equivalent broker, protect `main` and workflow edits, and
-restrict token permissions. These repository settings are not provisioned by this change.
+The workflow uses the configured source and image access settings. Temporary runner
+authentication is cleaned up after image preparation. Docker Hub images are pulled anonymously
+and remain subject to its rate limits. Repository administration is managed separately.
 
 Test workspace keys, database credentials, object-storage credentials, model placeholder keys,
 and session signing keys are local ephemeral test values. Failure diagnostics print resource
