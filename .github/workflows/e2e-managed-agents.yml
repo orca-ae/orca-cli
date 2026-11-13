@@ -3,8 +3,7 @@
 
 name: E2E - Managed Agents direct
 
-on:
-  pull_request:
+"on":
   push:
     branches: [main]
   schedule:
@@ -22,6 +21,10 @@ concurrency:
 jobs:
   secret-gate:
     name: Check Managed Agents source access
+    # Never admit PR code or a manual dispatch from a feature branch.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -30,16 +33,9 @@ jobs:
       - name: Decide whether the E2E job can run
         id: gate
         env:
-          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           SNBOT_GITHUB_TOKEN: ${{ secrets.SNBOT_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" && \
-                "${PR_HEAD_REPOSITORY:-}" != "${GITHUB_REPOSITORY}" ]]; then
-            echo "enabled=false" >> "${GITHUB_OUTPUT}"
-            echo "Skipping internal-source E2E for a fork pull request."
-            exit 0
-          fi
           if [[ -z "${SNBOT_GITHUB_TOKEN:-}" ]]; then
             echo "::error::Missing required E2E secret: SNBOT_GITHUB_TOKEN"
             exit 1
@@ -50,7 +46,8 @@ jobs:
     name: CLI against pinned Managed Agents stack
     needs: secret-gate
     if: needs.secret-gate.outputs.enabled == 'true'
-    runs-on: ${{ vars.E2E_RUNNER || 'ubuntu-latest' }}
+    # Keep credential-backed tests on an ephemeral GitHub-hosted runner.
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       KIND_CLUSTER_NAME: orca-cli-managed-agents
@@ -58,6 +55,9 @@ jobs:
     steps:
       - name: Check out CLI
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       # Failure diagnostics include pod logs, which must not reach a public
       # repository's run logs. Scheduled runs carry no repository payload, so
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - uses: docker/setup-buildx-action@v3
 
@@ -203,19 +203,16 @@ jobs:
             --name "${KIND_CLUSTER_NAME}" \
             orca-managed-agents-fixture:e2e
 
-      - name: Configure GHCR pull access
+      # Authenticate only on the runner; never give registry credentials to Kind.
+      - name: Pull and load backend images without cluster credentials
         env:
           GH_TOKEN: ${{ secrets.SNBOT_GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          kubectl create namespace "${KIND_HELM_NAMESPACE}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          username=$(gh api user --jq .login)
-          kubectl --namespace "${KIND_HELM_NAMESPACE}" create secret docker-registry orca-e2e-ghcr \
-            --docker-server=ghcr.io \
-            --docker-username="${username}" \
-            --docker-password="${GH_TOKEN}" \
-            --dry-run=client -o yaml | kubectl apply -f -
+          REGISTRY_IMAGE: ${{ steps.registry-image.outputs.source_image }}
+          REGISTRY_RESOLVED_IMAGE: ${{ steps.registry-image.outputs.resolved_image }}
+          HARNESS_IMAGE: ${{ steps.harness-image.outputs.source_image }}
+          HARNESS_RESOLVED_IMAGE: ${{ steps.harness-image.outputs.resolved_image }}
+          GATEWAY_IMAGE: ${{ steps.gateway-image.outputs.source_image }}
+        run: tests/e2e/load-backend-images.sh
 
       - name: Deploy Managed Agents with Helm
         env:
@@ -226,7 +223,6 @@ jobs:
           MANAGED_AGENTS_HARNESS_IMAGE: ${{ steps.harness-image.outputs.source_image }}
           MANAGED_AGENTS_AI_GATEWAY_IMAGE: ${{ steps.gateway-image.outputs.source_image }}
           MANAGED_AGENTS_FIXTURE_IMAGE: orca-managed-agents-fixture:e2e
-          MANAGED_AGENTS_IMAGE_PULL_SECRET: orca-e2e-ghcr
         run: tests/e2e/deploy-managed-agents-helm.sh
 
       - name: Run CLI against Managed Agents

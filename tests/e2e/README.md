@@ -38,11 +38,12 @@ daemon. The paired images must carry the same 40-character source revision. That
 the matching Helm Chart and deterministic fixture source, and all resolved revisions are recorded
 in the GitHub Job Summary.
 
-Kind nodes pull service and infrastructure images directly from their remote registries. The only
-locally loaded image is the deterministic fixture, which does not have a published image. No
-in-cluster image registry is deployed. PostgreSQL, RustFS, Kind, Kubernetes, and other infrastructure
-remain version-pinned. AI Gateway has an independent release train, so each run uses the explicit
-version pinned by that Chart revision.
+The workflow pulls backend images on the runner and loads them into Kind alongside the
+locally built deterministic fixture. Registry and Harness are pulled by their resolved digest
+and tagged with the chart's expected names; AI Gateway uses the explicit tag pinned by the chart.
+The chart's three backend services use `Never` pull policy, so a missing preload fails rather
+than authenticating from inside the cluster. Infrastructure images remain version-pinned and
+are pulled anonymously by Kind. No in-cluster registry credential is created.
 
 The official `charts/orca-managed-agents` Chart deploys the engine's internal Registry, Harness,
 and AI Gateway. Harness uses the Chart's `in-memory` sandbox runtime and the upstream Kind fixture
@@ -50,24 +51,25 @@ as its Anthropic endpoint. The fixture returns marker-based deterministic respon
 real model request. PostgreSQL is used for the transcript store to keep the CLI suite smaller than
 Managed Agents' own Kafka/OpenSandbox conformance suite.
 
-The direct Managed Agents workflow runs automatically on same-repository pull requests, `main`,
-and the nightly schedule. It defaults to the standard `ubuntu-latest` GitHub-hosted runner. Set
-the Actions repository variable `E2E_RUNNER` to override the runner label; no additional secret
-is required.
+The direct Managed Agents workflow runs only on trusted `main` pushes, the nightly schedule,
+and manual dispatches selecting `main`. It checks out the triggering commit SHA on an ephemeral
+GitHub-hosted runner and does not restore PR-populated Go caches. The ordinary `CI` workflow
+continues running unit and exhaustive mock-backed CLI command E2E tests on every PR without
+secrets. Full-stack integration runs after merge.
 
 Real-service tests isolate each lifecycle scenario. A failed scenario stops at its first failed
 command, records the scenario name, and allows every remaining scenario to run. After all tests
 finish, the suite prints the combined failure count and exits unsuccessfully when that count is
 non-zero.
 
-The workflow requires `SNBOT_GITHUB_TOKEN` to check out the matching Chart source and create the
-Kind namespace's GHCR pull secret for its pinned AI Gateway image. Docker Hub credentials are not
-required; its images are pulled anonymously by Kind and remain subject to Docker Hub rate limits.
-Test workspace keys, database credentials, object-storage credentials, model placeholder keys, and
-session signing keys are local ephemeral test values and are not repository secrets. The
-secret-backed workflow skips fork pull requests because GitHub does not expose repository secrets
-to them. Failure diagnostics print resource status; pod logs are included only while the repository
-is private. The workflow uploads no artifacts.
+The workflow uses the configured source and image access settings. Temporary runner
+authentication is cleaned up after image preparation. Docker Hub images are pulled anonymously
+and remain subject to its rate limits. Repository administration is managed separately.
+
+Test workspace keys, database credentials, object-storage credentials, model placeholder keys,
+and session signing keys are local ephemeral test values. Failure diagnostics print resource
+status; pod logs are included only while the repository is private. No private-source artifacts
+are uploaded.
 
 To run the scenarios against an already reachable direct deployment with the deterministic fixture
 and seeded model prices:
